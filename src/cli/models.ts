@@ -243,7 +243,7 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
     if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
     const f = frame();
     stdout.write(`${f}\n`);
-    lastHeight = physicalRows(f) + 1;
+    lastHeight = physicalRows(f); // cursor ends N rows below the top, not N+1
   };
 
   const searchSoon = (): void => {

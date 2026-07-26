@@ -232,7 +232,10 @@ export async function runMenu(o: MenuOptions): Promise<void> {
     if (redrawInPlace && lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
     const f = frame(o, cursor);
     stdout.write(`${f}\n`);
-    lastHeight = physicalRows(f) + 1;
+    // After printing an N-row frame plus its newline, the cursor sits exactly
+    // N rows below the frame's top — not N+1. Overshooting by one row per
+    // redraw makes the frame crawl upward into the scrollback above it.
+    lastHeight = physicalRows(f);
   };
 
   const move = (dir: 1 | -1): void => {

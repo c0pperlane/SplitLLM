@@ -125,7 +125,7 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
     if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
     const frame = render(working, cursor, dirty);
     stdout.write(frame + '\n');
-    lastHeight = physicalRows(frame) + 1;
+    lastHeight = physicalRows(frame); // cursor ends N rows below the top, not N+1
   };
 
   const adjust = (dir: 1 | -1): void => {
