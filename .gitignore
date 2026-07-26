@@ -1,0 +1,24 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.log
+
+# Local state — credentials, database, personal settings. Never commit these.
+splitllm.db
+splitllm.db-shm
+splitllm.db-wal
+splitllm.endpoints.json
+splitllm.settings.json
+.env
+.env.local
+!.env.example
+
+# Generated output from /design, /site and agent runs
+agent-out*/
+game-out*/
+chatapp/
+design-out.html
+nebula*.html
+site.html
+skeleton-test.html
+shot-*.png

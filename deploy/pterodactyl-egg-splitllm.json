@@ -1,0 +1,102 @@
+{
+  "_comment": "SplitLLM V2 — router-based local AI backend. Import via Admin -> Nests -> Import Egg. Requires the splitllm-v2 image to exist on the node (see deploy/README.md); it is not on a public registry.",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-07-26T00:00:00+00:00",
+  "name": "SplitLLM V2",
+  "author": "splitllm@local",
+  "description": "Deterministic knowledge router plus a local Ollama model, exposed as an authenticated HTTP API with NDJSON streaming. Bundles its own Ollama so the deployment cannot come up half-alive.",
+  "features": null,
+  "docker_images": {
+    "SplitLLM V2 (bundled Ollama)": "splitllm-v2:latest"
+  },
+  "file_denylist": [],
+  "startup": "/usr/local/bin/entrypoint.sh",
+  "config": {
+    "files": "{}",
+    "startup": "{\r\n    \"done\": \"splitllm api on\"\r\n}",
+    "logs": "{}",
+    "stop": "^^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\n# The application ships inside the image; the install step only prepares the\n# data volume. Anything written outside /mnt/server is discarded by Wings.\nset -e\nmkdir -p /mnt/server/data/ollama\ncat > /mnt/server/README.txt <<'EOF'\nSplitLLM V2\n\ndata/splitllm.db   knowledge graph (modules, edges, evidence)\ndata/ollama        downloaded model weights — several GB\nollama.log         model server log\n\nThe API needs SPLITLLM_API_TOKEN set or it refuses to start.\nEndpoints: GET /ping (open), GET /health, POST /v1/chat, POST /v1/chat/stream,\nPOST /v1/route, GET /v1/modules  (all except /ping need a bearer token).\nEOF\necho 'install complete'\n",
+      "container": "ghcr.io/pterodactyl/installers:debian",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "API token",
+      "description": "Bearer token required on every request. Generate one with: openssl rand -hex 32. The server refuses to start if this is empty.",
+      "env_variable": "SPLITLLM_API_TOKEN",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|min:16|max:256",
+      "field_type": "text"
+    },
+    {
+      "name": "Model",
+      "description": "Ollama model tag pulled on first start. qwen3:4b is the tested default; qwen3:1.7b for a smaller footprint.",
+      "env_variable": "SPLITLLM_MODEL",
+      "default_value": "qwen3:4b",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|max:128",
+      "field_type": "text"
+    },
+    {
+      "name": "Bind address",
+      "description": "Must be 0.0.0.0 inside a container so Wings can map the allocated port.",
+      "env_variable": "SPLITLLM_BIND",
+      "default_value": "0.0.0.0",
+      "user_viewable": true,
+      "user_editable": false,
+      "rules": "required|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Port",
+      "description": "Must match the server's primary allocation port.",
+      "env_variable": "SPLITLLM_PORT",
+      "default_value": "8080",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|between:1024,65535",
+      "field_type": "text"
+    },
+    {
+      "name": "Ollama host",
+      "description": "Leave as-is to run Ollama inside this container. Point it elsewhere (http://10.0.0.2:11434) to share one model server between containers.",
+      "env_variable": "OLLAMA_HOST",
+      "default_value": "http://127.0.0.1:11434",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Context window",
+      "description": "num_ctx passed to Ollama. Larger costs RAM roughly linearly.",
+      "env_variable": "SPLITLLM_NUM_CTX",
+      "default_value": "8192",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|between:512,131072",
+      "field_type": "text"
+    },
+    {
+      "name": "Max concurrent generations",
+      "description": "One CPU runner cannot interleave generations; above 1 they thrash. Excess requests get 429 instead of a silent slowdown.",
+      "env_variable": "SPLITLLM_MAX_CONCURRENT",
+      "default_value": "1",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|between:1,8",
+      "field_type": "text"
+    }
+  ]
+}

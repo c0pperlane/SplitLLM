@@ -1,0 +1,54 @@
+# Plain-Docker deployment, for the homeserver without going through Pterodactyl.
+#
+# Use this when you want the backend up in one command; use the egg when you
+# want it managed alongside the game servers with a console and resource limits.
+# They build the same image and behave identically.
+#
+#   cd ~/splitllm-v2
+#   printf 'SPLITLLM_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+#   docker compose up -d --build
+#
+services:
+  splitllm:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: splitllm-v2:latest
+    container_name: splitllm-v2
+    restart: unless-stopped
+    # Loopback only. The path in is the WireGuard tunnel plus nginx, not a port
+    # open to the internet — publishing 0.0.0.0:8080 here would quietly bypass
+    # every access control in front of it.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SPLITLLM_API_TOKEN: ${SPLITLLM_API_TOKEN:?set SPLITLLM_API_TOKEN in .env}
+      SPLITLLM_MODEL: ${SPLITLLM_MODEL:-qwen3:4b}
+      SPLITLLM_BIND: "0.0.0.0"
+      SPLITLLM_PORT: "8080"
+      SPLITLLM_MAX_CONCURRENT: ${SPLITLLM_MAX_CONCURRENT:-1}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://127.0.0.1:11434}
+      OLLAMA_MODELS: /home/container/data/ollama
+      SPLITLLM_DB: /home/container/data/splitllm.db
+    volumes:
+      # Model weights and the knowledge graph. Losing this means re-downloading
+      # several GB and relearning the graph, so it is a named volume rather than
+      # anything tied to the container lifecycle.
+      - splitllm-data:/home/container/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ping"]
+      interval: 30s
+      timeout: 5s
+      start_period: 180s
+      retries: 3
+    # A 4B model on CPU will take every core it is given. Leaving headroom is
+    # not politeness: this box also runs Wings, and a starved Wings drops the
+    # panel websocket.
+    deploy:
+      resources:
+        limits:
+          cpus: "${SPLITLLM_CPUS:-6}"
+          memory: ${SPLITLLM_MEMORY:-8g}
+
+volumes:
+  splitllm-data:
