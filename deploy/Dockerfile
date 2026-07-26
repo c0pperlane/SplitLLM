@@ -53,6 +53,12 @@ COPY --chown=root:root src /opt/splitllm/src
 COPY --chown=root:root deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Pre-create the data directory with container ownership. A fresh named volume
+# is initialised from this directory, so without it the volume is root-owned
+# and the unprivileged entrypoint cannot mkdir inside it.
+RUN mkdir -p /home/container/data/ollama \
+ && chown -R container:container /home/container/data
+
 ENV SPLITLLM_HOME=/opt/splitllm \
     SPLITLLM_BIND=0.0.0.0 \
     SPLITLLM_PORT=8080 \
