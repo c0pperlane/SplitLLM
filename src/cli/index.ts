@@ -38,10 +38,12 @@ import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
 import { UsageLedger, renderUsage } from './usage.ts';
+import { runModelBrowser } from './models.ts';
 import { runSettingsMenu, runEndpointsMenu, settingsShortcut, type SettingsCtx } from './settings-menu.ts';
 import type { Provider } from '../providers/types.ts';
 import { EndpointRegistry, KIND_DEFAULTS } from '../providers/endpoints.ts';
 import { providerFor } from '../providers/factory.ts';
+import { SplitLlmProvider } from '../providers/remote.ts';
 import {
   addEndpoint,
   addEndpointInline,
@@ -306,6 +308,63 @@ function designProvider(ctx: Ctx): OllamaProvider {
   return new OllamaProvider();
 }
 
+/**
+ * Switch the model generation uses, on whichever node it uses.
+ *
+ * Where the switch has to happen differs per node kind: for a `splitllm`
+ * backend the model lives server-side (so we ask it to switch, and only record
+ * the choice locally when it says yes); for every other endpoint the model is
+ * just a request field we send; for the local Ollama it is a provider swap
+ * plus capability discovery, with the forgiving prefix match `/model` has
+ * always had.
+ */
+async function switchToModel(ctx: Ctx, arg: string): Promise<void> {
+  const activeEp = ctx.endpoints.active();
+
+  if (activeEp) {
+    if (activeEp.kind === 'splitllm') {
+      try {
+        await new SplitLlmProvider(activeEp).useModel(arg);
+      } catch (err) {
+        console.log(color.red(`  backend refused the switch: ${err instanceof Error ? err.message : String(err)}`));
+        return;
+      }
+    }
+    ctx.endpoints.update(activeEp.id, { model: arg });
+    ctx.provider.current = providerFor({ ...activeEp, model: arg });
+    ctx.session.caps = undefined; // capability discovery is Ollama-only
+    console.log(color.green(`  ${activeEp.id} → ${arg}`));
+    syncBar(ctx);
+    return;
+  }
+
+  const models = await listChatModels();
+  if (models.length === 0) {
+    console.log(color.yellow('  no local chat models found — is Ollama running? Pull one with /models.'));
+    return;
+  }
+  const match =
+    models.find((m) => m.name === arg) ??
+    models.find((m) => m.name.toLowerCase().startsWith(arg.toLowerCase())) ??
+    models.find((m) => m.name.toLowerCase().includes(arg.toLowerCase()));
+  if (!match) {
+    console.log(color.red(`  no local model matching '${arg}'`));
+    console.log(color.grey(`  installed: ${models.map((m) => m.name).join(', ')}`));
+    console.log(color.grey('  download more in /models'));
+    return;
+  }
+
+  ctx.provider.current = new OllamaProvider(match.name);
+  ctx.session.caps = await getCapabilities(match.name);
+  console.log(color.green(`  switched to ${match.name}`));
+  console.log(color.grey(`    ${describeModel(ctx.session.caps, match.name)}`));
+  if (ctx.session.caps && !ctx.session.caps.canThink && ctx.session.thinking) {
+    console.log(color.yellow('  ! this model has no thinking capability — /think on will be ignored'));
+  }
+  void new OllamaProvider(match.name).preload();
+  syncBar(ctx);
+}
+
 function switchToEndpoint(ctx: Ctx, id: string | undefined, opts?: { quiet?: boolean }): void {
   const ep = id ? ctx.endpoints.get(id) : undefined;
   if (!ep) {
@@ -451,58 +510,28 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
       }
     }
 
-    case 'model': {
-      // On a remote endpoint, the model list comes from that server — the local
-      // Ollama's tags are irrelevant and listing them would be actively wrong.
+    case 'model':
+    case 'models': {
       const activeEp = ctx.endpoints.active();
-      if (activeEp) {
-        if (!arg) {
-          console.log(color.dim(`  endpoint ${activeEp.id} (${activeEp.kind}) · model ${color.green(activeEp.model ?? '(none set)')}`));
-          await testEndpoint(ctx.endpoints, activeEp.id);
-          console.log(color.grey('\n  switch model with /model <name>   ·   switch endpoint with /endpoint use <id>'));
-          return false;
-        }
-        ctx.endpoints.update(activeEp.id, { model: arg });
-        provider.current = providerFor({ ...activeEp, model: arg });
-        session.caps = undefined; // capability discovery is Ollama-only
-        console.log(color.green(`  ${activeEp.id} → ${arg}`));
-        return false;
-      }
-
-      const models = await listChatModels();
-      if (models.length === 0) {
-        console.log(color.yellow('  no local chat models found — is Ollama running?'));
-        return false;
-      }
       if (!arg) {
-        for (const m of models) {
-          const caps = await getCapabilities(m.name);
-          const mark = m.name === provider.current.model ? color.green(' ← active') : '';
-          console.log(`  ${describeModel(caps, m.name)}${mark}`);
+        // Bare /model opens the browser: switch, inspect thinking support,
+        // download — on whichever node generation currently uses.
+        ctx.bar.pause();
+        try {
+          await runModelBrowser({
+            rl: ctx.rl,
+            ask: async (p) => (await ctx.lines.next(p)) ?? '',
+            activeEndpoint: activeEp && activeEp.enabled !== false ? activeEp : undefined,
+            currentModel: () => provider.current.model,
+            switchTo: (m) => switchToModel(ctx, m),
+          });
+        } finally {
+          ctx.bar.resume();
+          syncBar(ctx);
         }
-        console.log(color.grey('\n  switch with /model <name>   ·   add more with: ollama pull <name>'));
         return false;
       }
-
-      // Accept a unique prefix so the user need not type the full tag.
-      const match =
-        models.find((m) => m.name === arg) ??
-        models.find((m) => m.name.toLowerCase().startsWith(arg.toLowerCase())) ??
-        models.find((m) => m.name.toLowerCase().includes(arg.toLowerCase()));
-      if (!match) {
-        console.log(color.red(`  no local model matching '${arg}'`));
-        console.log(color.grey(`  available: ${models.map((m) => m.name).join(', ')}`));
-        return false;
-      }
-
-      provider.current = new OllamaProvider(match.name);
-      session.caps = await getCapabilities(match.name);
-      console.log(color.green(`  switched to ${match.name}`));
-      console.log(color.grey(`    ${describeModel(session.caps, match.name)}`));
-      if (session.caps && !session.caps.canThink && session.thinking) {
-        console.log(color.yellow('  ! this model has no thinking capability — /think on will be ignored'));
-      }
-      void new OllamaProvider(match.name).preload();
+      await switchToModel(ctx, arg);
       return false;
     }
 
@@ -818,7 +847,7 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
 function printHelp(): void {
   console.log(`
 ${color.bold('  commands')}
-    /model [name]               list local models, or switch (prefix match works)
+    /models [name]              model browser: switch, thinking support, downloads
     /effort <low..max>          router breadth: seeds, hops, modules, pages
     /think <on|off|show>        toggle reasoning; 'show' displays it
     /design <brief>             generate a page, verify it, repair until it converges

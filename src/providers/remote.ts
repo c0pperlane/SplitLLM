@@ -293,6 +293,22 @@ export class AnthropicProvider implements Provider {
 // SplitLLM V2 backend (this project's own API)
 // ---------------------------------------------------------------------------
 
+export interface SplitLlmModelInfo {
+  name: string;
+  sizeBytes: number;
+  parameterSize: string;
+  quantization: string;
+  thinking: boolean;
+  active: boolean;
+}
+
+export interface PullEvent {
+  status: string;
+  percent?: number;
+  completedBytes?: number;
+  totalBytes?: number;
+}
+
 export class SplitLlmProvider implements Provider {
   readonly id = 'splitllm' as const;
   readonly model: string;
@@ -333,6 +349,75 @@ export class SplitLlmProvider implements Provider {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${await errorBody(res)}`);
     const body = (await res.json()) as { model?: string };
     return body.model ? [body.model] : [];
+  }
+
+  /**
+   * Everything installed on the backend, with thinking resolved per model.
+   * Backends older than the model routes answer without a `models` array —
+   * degrade to "just the active one" rather than failing.
+   */
+  async catalog(): Promise<{ active: string; models: SplitLlmModelInfo[] }> {
+    const res = await fetch(`${this.ep.baseUrl}/v1/models`, {
+      headers: this.headers(),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${await errorBody(res)}`);
+    const body = (await res.json()) as {
+      model?: string;
+      models?: Array<{
+        name?: string;
+        sizeBytes?: number;
+        parameterSize?: string;
+        quantization?: string;
+        thinking?: boolean;
+        active?: boolean;
+      }>;
+    };
+    const active = body.model ?? this.model;
+    const models = (body.models ?? []).flatMap((m) =>
+      m.name
+        ? [
+            {
+              name: m.name,
+              sizeBytes: m.sizeBytes ?? 0,
+              parameterSize: m.parameterSize ?? '?',
+              quantization: m.quantization ?? '?',
+              thinking: Boolean(m.thinking),
+              active: Boolean(m.active),
+            },
+          ]
+        : [],
+    );
+    return { active, models };
+  }
+
+  /** Download a model onto the backend, with progress mirrored from its NDJSON stream. */
+  async pullModel(model: string, onProgress?: (p: PullEvent) => void): Promise<void> {
+    const res = await fetch(`${this.ep.baseUrl}/v1/models/pull`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ model }),
+      // A multi-GB pull over a slow link takes tens of minutes.
+      signal: AbortSignal.timeout(3_600_000),
+    });
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${await errorBody(res)}`);
+    for await (const ev of readNdjson<{ type?: string; status?: string; percent?: number; completedBytes?: number; totalBytes?: number; error?: string }>(res.body)) {
+      if (ev.type === 'error') throw new Error(ev.error ?? 'backend reported a pull failure');
+      if (ev.type === 'progress') {
+        onProgress?.({ status: ev.status ?? '', percent: ev.percent, completedBytes: ev.completedBytes, totalBytes: ev.totalBytes });
+      }
+    }
+  }
+
+  /** Switch the backend's active model. Throws (HTTP 404) when it is not installed. */
+  async useModel(model: string): Promise<void> {
+    const res = await fetch(`${this.ep.baseUrl}/v1/models/use`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ model }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${await errorBody(res)}`);
   }
 
   async generate(opts: GenerateOptions): Promise<GenerateResult> {

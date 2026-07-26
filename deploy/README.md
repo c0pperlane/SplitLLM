@@ -21,7 +21,9 @@ if no token is configured, so a deployment cannot come up accidentally open.
 |---|---|---|---|
 | GET | `/ping` | no | liveness only; reveals nothing else |
 | GET | `/health` | yes | model readiness, graph size, in-flight count |
-| GET | `/v1/models` | yes | active model |
+| GET | `/v1/models` | yes | installed models + the active one, with `thinking` per model |
+| POST | `/v1/models/pull` | yes | download a model onto the node, NDJSON progress stream |
+| POST | `/v1/models/use` | yes | switch the active model (boot default stays `SPLITLLM_MODEL`) |
 | GET | `/v1/modules` | yes | knowledge-graph contents |
 | POST | `/v1/route` | yes | routing decision + full trace, no generation |
 | POST | `/v1/chat` | yes | complete answer as JSON |

@@ -30,6 +30,7 @@ import { DEFAULT_THRESHOLDS, EFFORT_ORDER, type Effort } from '../router/thresho
 import { allowedCores, coreCount, getSettings, totalRamGb } from '../config/settings.ts';
 import { TokenAuth, presentedToken } from './auth.ts';
 import { RateLimiter, callerIp } from './limit.ts';
+import { installedNames, listServerModels, pullServerModel } from './models.ts';
 import { learn } from '../learn/orchestrator.ts';
 import type { ChatMessage } from '../providers/types.ts';
 
@@ -87,9 +88,12 @@ interface ChatBody {
 export function createApi(opts: ServerOptions = {}): { server: Server; close: () => Promise<void> } {
   const auth = opts.auth ?? TokenAuth.fromEnv();
   const db = new GraphDb(opts.dbPath ?? defaultDbPath());
-  const provider = new OllamaProvider(
+  const ollamaHost = opts.ollamaHost ?? process.env.OLLAMA_HOST ?? 'http://localhost:11434';
+  // Mutable: POST /v1/models/use swaps the active model at runtime. Every route
+  // reads the variable at request time, so the swap takes effect immediately.
+  let provider = new OllamaProvider(
     opts.model ?? process.env.SPLITLLM_MODEL ?? undefined,
-    opts.ollamaHost ?? process.env.OLLAMA_HOST ?? undefined,
+    ollamaHost,
   );
   const embedder = new OllamaEmbeddings();
   const maxConcurrent = opts.maxConcurrent ?? Number(process.env.SPLITLLM_MAX_CONCURRENT ?? 1);
@@ -186,8 +190,11 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
       case 'GET /health':
         return void (await getHealth(res));
       case 'GET /v1/models':
-        sendJson(res, 200, { model: provider.model, ollamaHost: process.env.OLLAMA_HOST ?? 'http://localhost:11434' });
-        return;
+        return void (await getModels(res));
+      case 'POST /v1/models/pull':
+        return void (await postModelPull(req, res));
+      case 'POST /v1/models/use':
+        return void (await postModelUse(req, res));
       case 'GET /v1/modules':
         sendJson(res, 200, {
           count: db.countModules(),
@@ -228,6 +235,76 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
       ramGb: Number(totalRamGb().toFixed(1)),
       uptimeSec: Math.round((Date.now() - startedAt) / 1000),
     });
+  }
+
+  /**
+   * The model catalogue: the active model plus everything installed, with the
+   * thinking capability resolved per model. `model`/`ollamaHost` keep their
+   * old shape — the CLI's probe reads them.
+   */
+  async function getModels(res: ServerResponse): Promise<void> {
+    const models = await listServerModels(ollamaHost);
+    sendJson(res, 200, {
+      model: provider.model,
+      ollamaHost,
+      models: models.map((m) => ({ ...m, active: m.name === provider.model })),
+    });
+  }
+
+  /**
+   * Pull a model onto this node, streaming Ollama's progress upward as NDJSON.
+   * No server-side timeout: a 5 GB layer on a slow link takes tens of minutes.
+   */
+  async function postModelPull(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson<{ model?: string }>(req, res);
+    if (!body) return;
+    const model = body.model?.trim();
+    if (!model) {
+      sendJson(res, 400, { error: 'expected { model }' });
+      return;
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'application/x-ndjson; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
+    });
+    const emit = (obj: unknown): void => {
+      if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`);
+    };
+    const controller = new AbortController();
+    req.on('aborted', () => controller.abort());
+
+    try {
+      emit({ type: 'start', model });
+      await pullServerModel(ollamaHost, model, (p) => emit({ type: 'progress', ...p }), controller.signal);
+      emit({ type: 'done', ok: true, model });
+      log(`  pulled model ${model}`);
+    } catch (err) {
+      const aborted = controller.signal.aborted;
+      emit({ type: 'error', error: aborted ? 'client aborted' : err instanceof Error ? err.message : String(err) });
+    } finally {
+      res.end();
+    }
+  }
+
+  /** Switch the active model at runtime. SPLITLLM_MODEL stays the boot default. */
+  async function postModelUse(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson<{ model?: string }>(req, res);
+    if (!body) return;
+    const model = body.model?.trim();
+    if (!model) {
+      sendJson(res, 400, { error: 'expected { model }' });
+      return;
+    }
+    const installed = await installedNames(ollamaHost);
+    if (!installed.includes(model)) {
+      sendJson(res, 404, { error: `'${model}' is not installed — POST /v1/models/pull first`, installed });
+      return;
+    }
+    provider = new OllamaProvider(model, ollamaHost);
+    log(`  active model -> ${model}`);
+    sendJson(res, 200, { ok: true, model });
   }
 
   function parseEffort(v: unknown): Effort {

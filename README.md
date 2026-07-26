@@ -211,7 +211,7 @@ it is a bigger local model, not more iterations.
 ## Commands
 
 ```
-/model [name]               list local models, or switch (prefix match works)
+/models [name]              model browser: switch, thinking support, downloads
 /effort <low..max>          router breadth: seeds, hops, modules, pages
 /think <on|off|show>        toggle reasoning
 /performance                CPU + memory sliders (arrow keys)
@@ -224,9 +224,11 @@ it is a bigger local model, not more iterations.
 /modules, /stats, /reindex, /exit
 ```
 
-`/model` reads the installed models straight from Ollama and asks `/api/show` what each one can
-actually do, so `/think` is only offered where the model reports a `thinking` capability. Add models
-with `ollama pull <name>` — no code change needed.
+`/models` opens the model browser: installed models with their thinking capability shown per
+row (read live from Ollama's `/api/show`), plus a curated download list with the same flag
+documented up front. Downloads work on whichever node generation uses — the local Ollama, a
+remote `ollama` endpoint, or a `splitllm` backend. `/model <name>` still switches directly,
+prefix-matched as always.
 
 ## Measured on a Snapdragon X Plus (X1P64100, 10 cores, 15.6 GB)
 
