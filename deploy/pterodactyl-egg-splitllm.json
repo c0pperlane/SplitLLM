@@ -79,16 +79,6 @@
       "field_type": "text"
     },
     {
-      "name": "Context window",
-      "description": "num_ctx passed to Ollama. Larger costs RAM roughly linearly.",
-      "env_variable": "SPLITLLM_NUM_CTX",
-      "default_value": "8192",
-      "user_viewable": true,
-      "user_editable": true,
-      "rules": "required|integer|between:512,131072",
-      "field_type": "text"
-    },
-    {
       "name": "Max concurrent generations",
       "description": "One CPU runner cannot interleave generations; above 1 they thrash. Excess requests get 429 instead of a silent slowdown.",
       "env_variable": "SPLITLLM_MAX_CONCURRENT",

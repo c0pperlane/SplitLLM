@@ -18,19 +18,60 @@ The third path is what makes it general. The model proposes what a page is about
 checked against the page text and discarded if absent; then the same statistical brakes decide what
 becomes routable. The model proposes, the maths decides — as everywhere else in this system.
 
-## Launch
+## Setup
 
-```bash
-splitllm.cmd
+**Requirements:** Node.js 24+ and ~5 GB of disk for the default model. No build step — Node 24 strips TypeScript natively.
+
+### Windows (local, single folder)
+
+```powershell
+git clone https://github.com/c0pperlane/SplitLLM.git
+cd SplitLLM
+powershell -ExecutionPolicy Bypass -File setup.ps1
+.\splitllm.cmd
 ```
 
-Or directly:
+`setup.ps1` installs Ollama (via winget) if missing, starts it, pulls the default model
+(`huihui_ai/qwen3.5-abliterated:4B`) and runs `npm install`. Everything stays in this one
+folder — no Docker, nothing installed system-wide except Ollama itself.
+
+### Linux (local)
 
 ```bash
-node --experimental-strip-types src/cli/index.ts
+git clone https://github.com/c0pperlane/SplitLLM.git
+cd SplitLLM
+chmod +x setup.sh splitllm.sh
+./setup.sh
+./splitllm.sh
 ```
 
-No build step — Node 24 strips TypeScript natively.
+Same steps: Ollama via the official installer if missing, model pull, `npm install`.
+
+Set `SPLITLLM_MODEL` before running setup to pull a different model; switch models any time
+in the CLI with `/model` — anything `ollama pull` can fetch works without code changes.
+
+## Run it as a remote endpoint (Docker)
+
+The CLI is not bound to the local machine. `/endpoint add` registers any number of model
+servers — Ollama, OpenAI-compatible, Anthropic, or another SplitLLM backend — and
+`/endpoint use` switches between them.
+
+The SplitLLM backend ships as a self-contained Docker image (API + bundled Ollama in one
+container, so it cannot come up half-alive). Identical on a Linux server or Windows with
+Docker Desktop:
+
+```bash
+# on the server
+git clone https://github.com/c0pperlane/SplitLLM.git
+cd SplitLLM/deploy
+# create .env containing one line: SPLITLLM_API_TOKEN=<64 random hex chars>
+# Linux:  printf 'SPLITLLM_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
+docker compose up -d --build
+```
+
+Then in the CLI: `/endpoint add` → `splitllm` → `host:8080` → the token. Full API
+reference, the Pterodactyl egg and reverse-proxy notes live in
+[deploy/README.md](deploy/README.md).
 
 ## Why it is built this way
 
