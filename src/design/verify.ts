@@ -238,7 +238,7 @@ interface ContrastHit {
   bg: string;
 }
 
-function parseRgb(s: string): [number, number, number] | undefined {
+export function parseRgb(s: string): [number, number, number] | undefined {
   const m = /rgba?\(([^)]+)\)/.exec(s);
   if (!m) return undefined;
   const p = m[1]!.split(',').map((x) => parseFloat(x));
@@ -253,7 +253,7 @@ function relLum([r, g, b]: [number, number, number]): number {
   return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
 }
 
-function ratioOf(a: [number, number, number], b: [number, number, number]): number {
+export function ratioOf(a: [number, number, number], b: [number, number, number]): number {
   const [l1, l2] = [relLum(a), relLum(b)];
   return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
 }

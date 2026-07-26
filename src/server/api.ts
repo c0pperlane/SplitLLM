@@ -204,6 +204,8 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
         return;
       case 'POST /v1/route':
         return void (await postRoute(req, res));
+      case 'POST /v1/ollama/chat':
+        return void (await postOllamaPassthrough(req, res));
       case 'POST /v1/chat':
         return void (await postChat(req, res, false));
       case 'POST /v1/chat/stream':
@@ -323,6 +325,74 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
     const q = body.query ?? body.message;
     if (typeof q !== 'string' || !q.trim()) return undefined;
     return { query: q, messages: [{ role: 'user', content: q }] };
+  }
+
+  /**
+   * Authenticated passthrough to the node's Ollama `/api/chat`.
+   *
+   * Exists for tool-calling. `/v1/chat` runs the router and returns prose, which
+   * an agent loop cannot drive: it needs to send `tools` and read `tool_calls`
+   * back. Without this the agent loop has no way to reach a remote node at all,
+   * and silently falls back to whatever Ollama is on the machine running the
+   * CLI — which is how a laptop ends up generating for eleven minutes while a
+   * 32-core server sits idle.
+   *
+   * The request body is forwarded as-is except for `model`, which is pinned to
+   * this server's configured model. A caller must not be able to make the node
+   * pull or run an arbitrary model through an authenticated endpoint.
+   */
+  async function postOllamaPassthrough(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson<Record<string, unknown>>(req, res);
+    if (!body) return;
+
+    if (inFlight >= maxConcurrent) {
+      res.setHeader('Retry-After', '10');
+      sendJson(res, 429, { error: 'busy', inFlight, maxConcurrent });
+      return;
+    }
+
+    const controller = new AbortController();
+    req.on('aborted', () => controller.abort());
+    res.on('close', () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
+    inFlight += 1;
+    const t0 = Date.now();
+    try {
+      const host = (process.env.OLLAMA_HOST ?? 'http://localhost:11434').replace(/\/$/, '');
+      const upstream = await fetch(`${host}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...body,
+          model: provider.model,
+          options: { num_ctx: getSettings().numCtx, ...(body.options as object | undefined) },
+        }),
+        signal: controller.signal,
+      });
+      if (!upstream.ok || !upstream.body) {
+        sendJson(res, 502, { error: `ollama HTTP ${upstream.status}` });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      });
+      // Byte-for-byte relay: the agent loop parses Ollama's own NDJSON, so
+      // re-shaping it here would only create a second format to keep in sync.
+      for await (const chunk of upstream.body) res.write(chunk);
+      res.end();
+      log(`  200 POST /v1/ollama/chat  ${Date.now() - t0}ms`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!res.headersSent) sendJson(res, controller.signal.aborted ? 499 : 502, { error: msg });
+      else res.end();
+      log(`  error POST /v1/ollama/chat: ${msg}`);
+    } finally {
+      inFlight -= 1;
+    }
   }
 
   async function postRoute(req: IncomingMessage, res: ServerResponse): Promise<void> {

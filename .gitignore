@@ -13,9 +13,10 @@ splitllm.settings.json
 .env.local
 !.env.example
 
-# Generated output from /design, /site and agent runs
+# Generated output from /design, /site, agent and benchmark runs
 agent-out*/
 game-out*/
+bench-out/
 chatapp/
 design-out.html
 nebula*.html

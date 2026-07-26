@@ -37,6 +37,8 @@ import { Browser } from '../design/cdp.ts';
 import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
+import { buildSystemPrompt, describePrompt, tierForModel, type PromptTier } from '../prompt/system.ts';
+import { detectMedium } from '../prompt/principles.ts';
 import { UsageLedger, renderUsage } from './usage.ts';
 import { runModelBrowser, printModelSearch } from './models.ts';
 import { runSettingsMenu, runEndpointsMenu, settingsShortcut, type SettingsCtx } from './settings-menu.ts';
@@ -77,30 +79,16 @@ interface Session {
   usage: UsageLedger;
 }
 
-const ANSWER_SYSTEM = `You are a precise, helpful assistant.
-You are given CONTEXT about topics that a deterministic router selected for this question.
-Ground your answer in that context. Answer in the same language the user wrote in.
-Be concise and concrete rather than general.
-
-Rules about the context:
-- Use ONLY specifics — names, paths, values, quantities, settings — that appear verbatim in the CONTEXT.
-- If you need a detail the CONTEXT does not contain, say what is missing instead of inventing it.
-- Never claim a value came from the context unless it literally appears there.`;
-
 /**
- * Used when the router selected nothing.
+ * Prompt tier for the model currently answering.
  *
- * Without this, the model happily answered "wie mache ich eine website" with a
- * fabricated Pterodactyl setup — inventing a `pgsql8.3-fpm.socket`, a
- * `systemctl start pterodactyl` service and a `private.key` path, then asserting
- * that all of it came from context. If there is no context, the model must be
- * told to answer generally and to say so.
+ * Parameter count comes from Ollama's /api/show and is absent for a remote
+ * endpoint, where `tierForModel` falls back to 'standard'. Erring short is
+ * deliberate — see prompt/system.ts for the measurement behind it.
  */
-const NO_CONTEXT_SYSTEM = `You are a helpful assistant.
-The knowledge router found NO modules relevant to this question, so you have no project-specific context.
-Answer from general knowledge, in the same language the user wrote in.
-Begin by stating briefly that this is a general answer with no project context behind it.
-Do NOT invent file paths, service names or configuration specific to any particular system.`;
+function promptTier(ctx: Ctx): PromptTier {
+  return tierForModel(ctx.session.caps?.parameterSize);
+}
 
 interface Ctx {
   rl: import('node:readline/promises').Interface;
@@ -692,6 +680,39 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
       return false;
     }
 
+    case 'systemprompt':
+    case 'prompt': {
+      // Shows the prompt that WOULD be sent, built the same way the real call
+      // builds it — not a copy kept in sync by hand, which would drift and then
+      // lie about what the model is actually being told.
+      const [taskArg, ...restArgs] = arg.split(/\s+/).filter(Boolean);
+      const task = (['chat', 'answer', 'agent', 'design'] as const).find((t) => t === taskArg) ?? 'answer';
+      const tier = (['compact', 'standard', 'full'] as const).find((t) => t === restArgs[0]) ?? promptTier(ctx);
+      const medium = task === 'design' ? detectMedium(restArgs.join(' ') || 'generic interface') : undefined;
+
+      const built = buildSystemPrompt({
+        task,
+        tier,
+        medium,
+        tools: task === 'agent' ? ['list_files', 'read_file', 'write_file', 'edit_file', 'verify'] : undefined,
+        context: task === 'answer' && session.lastTrace ? '(the last query\'s routed context goes here)' : undefined,
+      });
+
+      console.log(color.bold(`\n  ── SYSTEM PROMPT ────────────────────────────────────────────`));
+      console.log(color.dim(`  ${describePrompt(built)}`));
+      if (medium) console.log(color.dim(`  medium: ${medium}`));
+      console.log(color.grey('  /systemprompt <chat|answer|agent|design> [compact|standard|full] [brief]\n'));
+      console.log(built.text);
+      console.log(color.bold(`\n  ─────────────────────────────────────────────────────────────`));
+      console.log(
+        color.grey(
+          '  Tiers exist because prompt LENGTH collapsed tool use in testing: the same 4B\n' +
+            '  made 6 tool calls on a short prompt and 0 on a long one. Shorter is safer.',
+        ),
+      );
+      return false;
+    }
+
     case 'usage':
       console.log(
         renderUsage({
@@ -832,9 +853,11 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
       }
     }
 
-    const system = result.context
-      ? `${ANSWER_SYSTEM}\n\n# CONTEXT\n${result.context}`
-      : NO_CONTEXT_SYSTEM;
+    const system = buildSystemPrompt({
+      task: 'answer',
+      tier: promptTier(ctx),
+      context: result.context || undefined,
+    }).text;
 
     stdout.write('\n');
     let thinkingShown = false;
