@@ -56,6 +56,9 @@ import {
   testEndpoint,
 } from './endpoints-cmd.ts';
 
+/** Tools the model is told it has when permissions allow writing. */
+const AGENT_TOOL_NAMES = ['list_files', 'read_file', 'write_file', 'edit_file', 'verify'];
+
 /** Base thresholds with the user's performance settings folded in. */
 function activeThresholds(): typeof DEFAULT_THRESHOLDS {
   const s = getSettings();
@@ -448,11 +451,8 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
             console.log(color.red('  usage: /endpoint perf <id>'));
             return false;
           }
-          // Probe first when the node size is unknown: the CPU slider's ceiling
-          // is the node's real core count, and without it the panel can only
-          // say so rather than bound anything.
-          const ep = reg.find(target);
-          if (ep && !ep.node?.cores && ep.kind === 'splitllm') await testEndpoint(reg, ep.id);
+          // The panel re-probes the node itself, so the slider's ceiling is
+          // never a stale stored answer.
           ctx.bar.pause();
           try {
             await showNodePerfPanel(reg, target, ctx.rl);
@@ -834,6 +834,26 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
         color.grey('   (/debug for the numbers)'),
     );
 
+    // Compute-placement sanity, checked at send time rather than at set time.
+    // The node's GPU status is discovered by probing, so a setting that was
+    // valid when chosen can become wrong when the endpoint changes — and the
+    // failure is silent otherwise: Ollama quietly falls back to CPU and the
+    // user just thinks the GPU is slow.
+    const activeEp = ctx.endpoints.active();
+    if (activeEp?.perf?.compute === 'gpu') {
+      const gpu = activeEp.node?.gpu;
+      if (gpu && !gpu.available) {
+        console.log(
+          color.yellow(`  ! ${activeEp.id} is set to GPU but reports no GPU — this will run on CPU.`),
+        );
+        console.log(
+          color.grey(`    /endpoint perf ${activeEp.id} to set Compute back to auto, or pick a node that has one.`),
+        );
+      } else if (!gpu) {
+        console.log(color.grey(`  (${activeEp.id} has not reported whether it has a GPU — /endpoint test ${activeEp.id} to find out)`));
+      }
+    }
+
     const avail = await provider.current.available();
     if (!avail.ok) {
       console.log(color.red(`  model unavailable: ${avail.reason}`));
@@ -853,9 +873,20 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
       }
     }
 
+    // ALWAYS 'build', never a detected mode.
+    //
+    // An earlier draft gated this behind keyword matching — build verbs plus an
+    // artefact noun — so that "make me a dashboard" got the tools and "what is
+    // nginx" did not. That was the wrong shape. Capability is not something the
+    // user should have to phrase their way into, and a system prompt is by
+    // definition what the model can always do. The model decides whether a
+    // question needs a file written; the CLI does not decide it on the model's
+    // behalf from a regex.
     const system = buildSystemPrompt({
-      task: 'answer',
+      task: 'build',
       tier: promptTier(ctx),
+      medium: detectMedium(query),
+      tools: canWrite(session.permissions) ? AGENT_TOOL_NAMES : undefined,
       context: result.context || undefined,
     }).text;
 

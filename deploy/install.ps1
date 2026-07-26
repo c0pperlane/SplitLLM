@@ -1,0 +1,195 @@
+# SplitLLM V2 — one-command node installer (Windows).
+#
+#   powershell -ExecutionPolicy Bypass -File deploy\install.ps1
+#   powershell -ExecutionPolicy Bypass -File deploy\install.ps1 -Yes
+#
+# Same behaviour as install.sh: detect what can be detected, ask what cannot,
+# write .env, build, start, and wait until the API genuinely answers rather than
+# until Docker merely reports "running".
+#
+# Windows specifics worth knowing:
+#   * Docker Desktop must use the WSL2 backend for GPU passthrough. The Hyper-V
+#     backend cannot pass a GPU through at all, so a machine with a GPU can
+#     still legitimately end up on CPU here.
+#   * Cores and RAM are limited by the WSL2 VM, not by Windows. If the container
+#     seems capped below what you set, .wslconfig is the reason.
+
+param(
+  [switch]$Yes,
+  [string]$Model = '',
+  [int]$Port = 0
+)
+
+$ErrorActionPreference = 'Stop'
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $here
+Set-Location $root
+
+function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
+function Warn($m) { Write-Host " !  $m" -ForegroundColor Yellow }
+function Die($m)  { Write-Host "fatal: $m" -ForegroundColor Red; exit 1 }
+
+# ---------------------------------------------------------------------------
+# 1. Prerequisites
+# ---------------------------------------------------------------------------
+Step 'Checking prerequisites'
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+  Die 'docker not found. Install Docker Desktop and enable the WSL2 backend.'
+}
+docker info *> $null
+if ($LASTEXITCODE -ne 0) { Die 'Docker is installed but not running. Start Docker Desktop and retry.' }
+
+docker compose version *> $null
+if ($LASTEXITCODE -ne 0) { Die 'docker compose not available. Update Docker Desktop.' }
+Write-Host '  docker ok'
+
+# ---------------------------------------------------------------------------
+# 2. Detect the machine
+# ---------------------------------------------------------------------------
+Step 'Detecting hardware'
+$cores = [Environment]::ProcessorCount
+$ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+
+$gpuKind = 'none'
+$gpuUsable = $false
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+  $null = & nvidia-smi -L 2>$null
+  if ($LASTEXITCODE -eq 0) { $gpuKind = 'nvidia' }
+}
+
+Write-Host "  cores : $cores"
+Write-Host "  ram   : $ramGb GB"
+if ($gpuKind -eq 'nvidia') {
+  & nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | ForEach-Object { Write-Host "       $_" }
+} else {
+  Write-Host '  gpu   : none detected'
+}
+
+# A GPU on the host is not a GPU in a container — on Windows this depends on the
+# WSL2 backend. Prove it rather than assume it: a compose file requesting a
+# device the runtime cannot provide refuses to start at all.
+if ($gpuKind -eq 'nvidia') {
+  Step 'Checking Docker can reach the GPU'
+  docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi -L *> $null
+  if ($LASTEXITCODE -eq 0) {
+    $gpuUsable = $true
+    Write-Host '  GPU passthrough works' -ForegroundColor Green
+  } else {
+    Warn 'GPU found on the host but Docker cannot use it.'
+    Warn 'Docker Desktop -> Settings -> General -> "Use the WSL 2 based engine" must be ON.'
+    Warn 'Continuing with CPU.'
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Ask what cannot be detected
+# ---------------------------------------------------------------------------
+function Ask($prompt, $default) {
+  if ($Yes) { return $default }
+  $reply = Read-Host "$prompt [$default]"
+  if ([string]::IsNullOrWhiteSpace($reply)) { return $default }
+  return $reply
+}
+
+Step 'Configuration'
+# Full core count by default: the CLI has a per-node CPU slider, so this is a
+# ceiling and that is the dial. Capping here would hide a second limit under it.
+$cpuLimit = Ask '  CPU cores for the container (all is fine — the CLI limits per node)' $cores
+
+# No safe default. Under-allocating gets the model OOM-killed mid-generation,
+# which surfaces as a truncated answer rather than an error.
+$ramSuggest = if ($ramGb -gt 8) { $ramGb - 2 } else { $ramGb }
+Write-Host '  A 4B Q4 model needs ~4 GB plus context. 8 GB is a comfortable floor.' -ForegroundColor DarkGray
+$memLimit = Ask '  RAM for the container in GB' $ramSuggest
+
+if ([string]::IsNullOrWhiteSpace($Model)) { $Model = Ask '  Model to download on first start' 'qwen3:4b' }
+if ($Port -eq 0) { $Port = [int](Ask '  Port to listen on' '8080') }
+
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+$token = ($bytes | ForEach-Object { $_.ToString('x2') }) -join ''
+
+# ---------------------------------------------------------------------------
+# 4. Write .env
+# ---------------------------------------------------------------------------
+Step 'Writing deploy\.env'
+$envPath = Join-Path $here '.env'
+@(
+  "# Generated by install.ps1 on $((Get-Date).ToUniversalTime().ToString('o'))"
+  "SPLITLLM_API_TOKEN=$token"
+  "SPLITLLM_MODEL=$Model"
+  "SPLITLLM_PORT=$Port"
+  "SPLITLLM_CPUS=$cpuLimit"
+  "SPLITLLM_MEMORY=${memLimit}g"
+  'SPLITLLM_MAX_CONCURRENT=1'
+) | Set-Content -Path $envPath -Encoding utf8
+
+# The token is a credential. Restrict it to the current user — the default ACL
+# on a user profile is usually fine, but "usually" is not a security property.
+try {
+  $acl = Get-Acl $envPath
+  $acl.SetAccessRuleProtection($true, $false)
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    "$env:USERDOMAIN\$env:USERNAME", 'FullControl', 'Allow')
+  $acl.SetAccessRule($rule)
+  Set-Acl -Path $envPath -AclObject $acl
+} catch { Warn "could not tighten permissions on .env: $_" }
+Write-Host "  wrote $envPath"
+
+$composeArgs = @('-f', (Join-Path $here 'docker-compose.yml'))
+if ($gpuUsable) {
+  $composeArgs += @('-f', (Join-Path $here 'docker-compose.gpu.yml'))
+  Write-Host '  GPU overlay enabled'
+}
+
+# ---------------------------------------------------------------------------
+# 5. Build and start
+# ---------------------------------------------------------------------------
+Step 'Building the image (first run downloads Node and Ollama — a few minutes)'
+& docker compose @composeArgs build
+if ($LASTEXITCODE -ne 0) { Die 'build failed' }
+
+Step 'Starting'
+& docker compose @composeArgs up -d
+if ($LASTEXITCODE -ne 0) { Die 'startup failed' }
+
+# ---------------------------------------------------------------------------
+# 6. Wait until it actually answers
+# ---------------------------------------------------------------------------
+# "running" in docker ps is not "working": the entrypoint still has several GB
+# of weights to pull. Polling /ping is the only honest success signal.
+Step 'Waiting for the API (first start pulls the model — this can take a while)'
+$url = "http://localhost:$Port"
+$ok = $false
+for ($i = 1; $i -le 600; $i++) {
+  try {
+    Invoke-RestMethod -Uri "$url/ping" -TimeoutSec 3 -ErrorAction Stop | Out-Null
+    Write-Host "  up after ${i}s" -ForegroundColor Green
+    $ok = $true
+    break
+  } catch { Start-Sleep -Seconds 1 }
+}
+if (-not $ok) {
+  Warn 'not answering after 10 minutes. Recent logs:'
+  & docker compose @composeArgs logs --tail 40
+  Die 'startup failed'
+}
+
+$health = try {
+  Invoke-RestMethod -Uri "$url/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 10 |
+    ConvertTo-Json -Compress
+} catch { '{}' }
+
+$hostName = $env:COMPUTERNAME.ToLower()
+Write-Host ''
+Write-Host 'SplitLLM node is running.' -ForegroundColor Green
+Write-Host ''
+Write-Host "  url    $url"
+Write-Host "  token  $token"
+Write-Host "  health $health"
+Write-Host ''
+Write-Host 'Add it from the SplitLLM CLI on another machine:'
+Write-Host "  /endpoint add splitllm <this-host>:$Port $token as $hostName" -ForegroundColor Cyan
+Write-Host ''
+Write-Host 'The token is in deploy\.env. Anyone holding it can use this node —' -ForegroundColor DarkGray
+Write-Host 'treat it like a password, and do not commit that file.' -ForegroundColor DarkGray

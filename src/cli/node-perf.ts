@@ -21,9 +21,11 @@ import { stdin, stdout } from 'node:process';
 import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
 import { KeyReader, physicalRows } from './menu.ts';
+import { probeEndpoint } from '../providers/factory.ts';
 import {
   EndpointRegistry,
   type Endpoint,
+  type Compute,
   type NodePerf,
   threadsForNode,
 } from '../providers/endpoints.ts';
@@ -33,6 +35,17 @@ const ESC = '\x1b';
 /** Sentinel meaning "send nothing; let the server decide". */
 const AUTO = -1;
 
+/** "3m ago"-style rendering of the probe timestamp. */
+function ageOf(seenAt: number): string {
+  const s = Math.max(0, Math.round((Date.now() - seenAt) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 interface NodeSpec {
   key: keyof NodePerf;
   label: string;
@@ -41,6 +54,40 @@ interface NodeSpec {
   step: number;
   format: (v: number, ep: Endpoint) => string;
   help: string;
+  /** Discrete choices instead of a numeric range, e.g. cpu/gpu/auto. */
+  choices?: readonly string[];
+}
+
+/** Compute placement, as an ordered list so ←/→ can step through it. */
+const COMPUTE_CHOICES: readonly Compute[] = ['auto', 'cpu', 'gpu'] as const;
+
+function computeSpec(ep: Endpoint): NodeSpec {
+  const gpu = ep.node?.gpu;
+  return {
+    key: 'compute',
+    label: 'Compute',
+    min: 0,
+    max: COMPUTE_CHOICES.length - 1,
+    step: 1,
+    choices: COMPUTE_CHOICES,
+    format: (i) => {
+      const choice = COMPUTE_CHOICES[i] ?? 'auto';
+      if (choice === 'auto') {
+        return gpu === undefined
+          ? color.grey('auto — Ollama decides (this node has not reported whether it has a GPU)')
+          : gpu.available
+            ? color.grey(`auto — Ollama decides; this node has ${gpu.name ?? 'a GPU'}${gpu.vramGb ? ` (${gpu.vramGb} GB)` : ''}`)
+            : color.grey('auto — Ollama decides; this node reports no GPU, so CPU either way');
+      }
+      if (choice === 'cpu') return 'cpu — every layer on CPU (num_gpu=0), even if a GPU exists';
+      // The case worth warning about, because it fails at request time, not here.
+      if (gpu === undefined) return `gpu — offload all layers   ${color.yellow('(GPU presence unknown on this node)')}`;
+      if (!gpu.available) return `gpu — offload all layers   ${color.red('⚠ this node has NO GPU; requests will fall back to CPU')}`;
+      return `gpu — offload all layers to ${gpu.name ?? 'the GPU'}${gpu.vramGb ? ` (${gpu.vramGb} GB VRAM)` : ''}`;
+    },
+    help:
+      'GPU support belongs to the NODE, not the model — any model can be offloaded if it fits in VRAM.',
+  };
 }
 
 function specsFor(ep: Endpoint): NodeSpec[] {
@@ -50,6 +97,7 @@ function specsFor(ep: Endpoint): NodeSpec[] {
   const maxCpu = cores ? cores * 100 : 6400;
 
   const all: NodeSpec[] = [
+    computeSpec(ep),
     {
       key: 'cpuPercent',
       label: 'CPU limit',
@@ -121,17 +169,24 @@ function bar(value: number, min: number, max: number, width = 28): string {
   return color.cyan('█'.repeat(filled)) + color.grey('░'.repeat(width - filled));
 }
 
-function render(ep: Endpoint, perf: NodePerf, cursor: number, dirty: boolean): string {
+function render(ep: Endpoint, perf: NodePerf, cursor: number, dirty: boolean, probeFailed?: string): string {
   const specs = specsFor(ep);
   const L: string[] = [];
   L.push('');
   L.push(color.bold(`  ── NODE PERFORMANCE · ${ep.id} ${'─'.repeat(Math.max(0, 38 - ep.id.length))}`));
 
   const n = ep.node;
+  if (probeFailed) {
+    L.push(
+      color.mochaRed(`  ${ep.kind} · ${ep.baseUrl} · unreachable (${probeFailed})`) +
+        color.grey(n?.cores ? ' — sliders use the last stored values' : ' — no stored values; ceilings are guesses'),
+    );
+  }
+  const age = n?.seenAt ? ` · seen ${ageOf(n.seenAt)}` : '';
   L.push(
     color.dim(
       n?.cores
-        ? `  ${ep.kind} · ${ep.baseUrl} · detected ${n.cores} cores${n.ramGb ? `, ${n.ramGb} GB RAM` : ''}`
+        ? `  ${ep.kind} · ${ep.baseUrl} · detected ${n.cores} cores${n.ramGb ? `, ${n.ramGb} GB RAM` : ''}${age}`
         : `  ${ep.kind} · ${ep.baseUrl} · ` +
           color.yellow('node size unknown — only a splitllm endpoint reports it'),
     ),
@@ -141,7 +196,10 @@ function render(ep: Endpoint, perf: NodePerf, cursor: number, dirty: boolean): s
 
   specs.forEach((spec, i) => {
     const active = i === cursor;
-    const v = perf[spec.key] ?? AUTO;
+    const raw = perf[spec.key];
+    const v = spec.choices
+      ? Math.max(0, spec.choices.indexOf(String(raw ?? spec.choices[0])))
+      : ((raw as number | undefined) ?? AUTO);
     L.push(`  ${active ? color.cyan('▶ ') : '  '}${active ? color.bold(spec.label.padEnd(24)) : spec.label.padEnd(24)}${bar(v, spec.min, spec.max)}`);
     L.push(`      ${spec.format(v, ep)}`);
     if (active) L.push(color.grey(`      ${spec.help}`));
@@ -171,6 +229,16 @@ export async function showNodePerfPanel(
     return undefined;
   }
 
+  // The slider's ceiling comes from the node's own /health, and nodes get
+  // resized. Always re-ask instead of trusting the stored answer — a stale
+  // "6 cores" on a 32-core box is exactly the confusion this panel exists for.
+  let probeFailed: string | undefined;
+  if (ep.kind === 'splitllm') {
+    const r = await probeEndpoint(ep, 8000);
+    if (r.ok && r.node?.cores) reg.update(ep.id, { node: r.node });
+    else if (!r.ok) probeFailed = r.reason ?? r.stage;
+  }
+
   const original: NodePerf = { ...(ep.perf ?? {}) };
   let working: NodePerf = { ...original };
   const specs = specsFor(ep);
@@ -178,7 +246,7 @@ export async function showNodePerfPanel(
   let dirty = false;
 
   if (!stdin.isTTY) {
-    stdout.write(`${render(ep, working, -1, false)}\n`);
+    stdout.write(`${render(ep, working, -1, false, probeFailed)}\n`);
     stdout.write(color.grey('  (not a TTY — sliders need an interactive terminal)\n'));
     return working;
   }
@@ -193,18 +261,30 @@ export async function showNodePerfPanel(
   let lastHeight = 0;
   const draw = (): void => {
     if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
-    const frame = render(ep, working, cursor, dirty);
+    const frame = render(ep, working, cursor, dirty, probeFailed);
     stdout.write(`${frame}\n`);
     lastHeight = physicalRows(frame) + 1;
   };
 
   const adjust = (dir: 1 | -1): void => {
     const spec = specs[cursor]!;
-    const cur = working[spec.key] ?? AUTO;
+
+    // A choice setting wraps around its list rather than clamping at the ends,
+    // because three options behind a slider that stops is needlessly fiddly.
+    if (spec.choices) {
+      const list = spec.choices;
+      const at = Math.max(0, list.indexOf(String(working[spec.key] ?? list[0])));
+      const next = list[(at + dir + list.length) % list.length]!;
+      (working as Record<string, unknown>)[spec.key] = next;
+      dirty = JSON.stringify(working) !== JSON.stringify(original);
+      return;
+    }
+
+    const cur = (working[spec.key] as number | undefined) ?? AUTO;
     // Stepping down off the bottom lands on AUTO rather than on a small number,
     // so "let the server decide" is reachable with the arrow keys.
     const next = cur <= 0 && dir < 0 ? AUTO : Math.max(spec.min, Math.min(spec.max, (cur < 0 ? 0 : cur) + dir * spec.step));
-    working[spec.key] = next;
+    (working as Record<string, unknown>)[spec.key] = next;
     dirty = JSON.stringify(working) !== JSON.stringify(original);
   };
 
@@ -237,7 +317,12 @@ export async function showNodePerfPanel(
           // future reader would have to know about.
           const clean: NodePerf = {};
           for (const [k, v] of Object.entries(working)) {
+            // Numeric settings: a negative value is the AUTO sentinel.
             if (typeof v === 'number' && v >= 0) (clean as Record<string, number>)[k] = v;
+            // Choice settings: 'auto' IS the default, so it is stored as absent
+            // too. Without this branch the compute switch would be silently
+            // discarded on save, because it is a string and not a number.
+            else if (typeof v === 'string' && v && v !== 'auto') (clean as Record<string, string>)[k] = v;
           }
           reg.update(ep.id, { perf: clean });
           stdout.write(color.green(`  ${ep.id}: node settings applied\n`));

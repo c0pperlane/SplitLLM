@@ -33,6 +33,8 @@ export const color = {
   blue: (s: string) => c(C.blue, s),
   cyan: (s: string) => c(C.cyan, s),
   grey: (s: string) => c(C.grey, s),
+  /** Catppuccin Mocha red (#f38ba8) — the offline/failure accent. */
+  mochaRed: (s: string) => c('\x1b[38;2;243;139;168m', s),
 };
 
 function verdictColor(v: string): string {

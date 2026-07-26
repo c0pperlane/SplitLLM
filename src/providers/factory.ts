@@ -63,9 +63,15 @@ async function fetchNodeInfo(ep: Endpoint, timeoutMs: number): Promise<NodeInfo 
     });
     // 503 still carries the node fields — a degraded backend is exactly when
     // you want to know how big the box is.
-    const body = (await res.json()) as { cores?: number; ramGb?: number };
+    const body = (await res.json()) as {
+      cores?: number;
+      ramGb?: number;
+      gpu?: { available: boolean; name?: string; vramGb?: number };
+    };
     if (typeof body.cores !== 'number') return undefined;
-    return { cores: body.cores, ramGb: body.ramGb, seenAt: Date.now() };
+    // gpu stays undefined when the node could not tell, which the UI renders as
+    // 'unknown' rather than as 'no GPU'.
+    return { cores: body.cores, ramGb: body.ramGb, gpu: body.gpu, seenAt: Date.now() };
   } catch {
     return undefined;
   }

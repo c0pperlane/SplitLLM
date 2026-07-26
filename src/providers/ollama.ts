@@ -26,7 +26,7 @@ import type {
 const DEFAULT_MODEL =
   process.env.SPLITLLM_MODEL ?? 'huihui_ai/qwen3.5-abliterated:4B';
 import { getSettings, threadsFor } from '../config/settings.ts';
-import { threadsForNode, type NodeInfo, type NodePerf } from './endpoints.ts';
+import { numGpuFor, threadsForNode, type NodeInfo, type NodePerf } from './endpoints.ts';
 
 const DEFAULT_HOST = process.env.OLLAMA_HOST ?? 'http://localhost:11434';
 
@@ -135,10 +135,21 @@ export class OllamaProvider implements Provider {
     return mins <= 0 ? '0' : `${mins}m`;
   }
 
-  /** Options block with `num_thread` omitted rather than sent as undefined. */
+  /**
+   * Options block, with anything unset OMITTED rather than sent as undefined.
+   *
+   * Ollama treats an explicit null differently from an absent key, and sending
+   * `num_gpu: undefined` serialises to nothing anyway — but building the object
+   * conditionally keeps 'let the server decide' meaning exactly that.
+   */
   private opts(extra: Record<string, unknown> = {}): Record<string, unknown> {
     const t = this.threads();
-    return { ...(t === undefined ? {} : { num_thread: t }), ...extra };
+    const g = numGpuFor(this.perf?.compute);
+    return {
+      ...(t === undefined ? {} : { num_thread: t }),
+      ...(g === undefined ? {} : { num_gpu: g }),
+      ...extra,
+    };
   }
 
   async available(): Promise<{ ok: boolean; reason?: string }> {

@@ -35,7 +35,15 @@
 
 import { INVARIANTS, MEDIA, SYNTAX_CHECKS, type Medium } from './principles.ts';
 
-export type PromptTask = 'chat' | 'answer' | 'agent' | 'design';
+/**
+ * 'build' is the one that matters: agentic tool use AND design invariants in a
+ * single prompt, so that asking for a website in plain conversation produces
+ * the same rigour a dedicated /design command used to. Design is a capability
+ * the model always has, not a mode the user must know to enter.
+ *
+ * 'agent' and 'design' remain for callers that want only one half.
+ */
+export type PromptTask = 'chat' | 'answer' | 'agent' | 'design' | 'build';
 export type PromptTier = 'compact' | 'standard' | 'full';
 
 export interface PromptOptions {
@@ -282,7 +290,26 @@ function designSection(tier: PromptTier, medium: Medium): string[] {
   );
   L.push('');
 
-  const invariants = tier === 'compact' ? INVARIANTS.slice(0, 7) : INVARIANTS;
+  /*
+   * At compact, carry only what the VERIFIER cannot teach.
+   *
+   * The prompt and `verify` are two channels to the same model, and they cost
+   * differently: prompt tokens are paid on every single turn, verifier findings
+   * only when there is something wrong — and they arrive with the exact value to
+   * use. So anything `verify` measures (contrast, spacing, type scale, motion,
+   * overflow, dead declarations) is cheaper delivered as a finding than as a
+   * standing rule.
+   *
+   * What the verifier can NEVER tell you is what is missing: it cannot see that
+   * a loading state was never built, or that "Feature 1" was meant to be real
+   * copy. Those stay in the prompt at every tier, because by the time the
+   * verifier runs they are already absent.
+   */
+  const uncheckable = INVARIANTS.filter((i) => !i.checkedBy?.length);
+  const invariants =
+    tier === 'compact'
+      ? [...uncheckable, ...INVARIANTS.filter((i) => i.checkedBy?.length).slice(0, 2)]
+      : INVARIANTS;
   for (const inv of invariants) {
     L.push(`- ${inv.rule}`);
     if (tier === 'full' && inv.why) L.push(`    ${inv.why}`);
@@ -290,7 +317,7 @@ function designSection(tier: PromptTier, medium: Medium): string[] {
 
   L.push('');
   L.push(`In this medium specifically:`);
-  const notes = tier === 'compact' ? profile.notes.slice(0, 5) : profile.notes;
+  const notes = tier === 'compact' ? profile.notes.slice(0, 4) : profile.notes;
   for (const n of notes) L.push(`- ${n}`);
 
   if (tier !== 'compact') {
@@ -360,7 +387,7 @@ function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string
   const items: string[] = [];
   const has = (t: string): boolean => !tools || tools.includes(t);
 
-  if (task === 'agent' || task === 'design') {
+  if (task === 'agent' || task === 'design' || task === 'build') {
     // Only ask about a check the model can actually perform. Telling it to
     // "run the syntax check" with no command tool is an instruction it can only
     // satisfy by pretending — which is the exact failure the list is for.
@@ -368,7 +395,7 @@ function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string
     else if (has('verify')) items.push('Did you actually call `verify`, or only intend to?');
     items.push('Is every file complete — no ellipses, no placeholders, no TODO?');
   }
-  if (task === 'design') {
+  if (task === 'design' || task === 'build') {
     items.push('Does every text/background pair reach 4.5:1?');
     items.push('Are the empty, loading, error and success states all built?');
     items.push('Is every spacing value on your chosen scale?');
@@ -408,17 +435,19 @@ export function buildSystemPrompt(opts: PromptOptions): BuiltPrompt {
   push('memory', memoryAndContext(tier, opts.task));
   // Craft is guidance for prose. An agent run at compact emits tool calls and
   // file contents, so the budget is better spent on the tool rules.
-  if (!(opts.task === 'agent' && tier === 'compact')) push('craft', craft(tier));
+  if (!((opts.task === 'agent' || opts.task === 'build') && tier === 'compact')) push('craft', craft(tier));
 
-  if (opts.task === 'agent') push('method', agentMethod(tier, opts.tools));
-  if (opts.task === 'agent' || opts.task === 'design') push('verification', verification(tier, opts.tools));
-  if (opts.task === 'design') push('design', designSection(tier, opts.medium ?? 'generic'));
-  if (opts.task === 'agent' || opts.task === 'design') push('output', outputHygiene(tier));
+  const agentic = opts.task === 'agent' || opts.task === 'build';
+  const designing = opts.task === 'design' || opts.task === 'build';
+  if (agentic) push('method', agentMethod(tier, opts.tools));
+  if (agentic || designing) push('verification', verification(tier, opts.tools));
+  if (designing) push('design', designSection(tier, opts.medium ?? 'generic'));
+  if (agentic || designing) push('output', outputHygiene(tier));
   if (opts.task === 'answer') push('context-rules', contextRules(Boolean(opts.context)));
 
   // Skipped for agent runs at compact: the output is files, not prose, and the
   // line costs budget that the tool rules need more.
-  if (!(opts.task === 'agent' && tier === 'compact')) {
+  if (!((opts.task === 'agent' || opts.task === 'build') && tier === 'compact')) {
     push('language', [
       opts.language ? `Answer in ${opts.language}.` : 'Answer in the same language the user wrote in.',
     ]);

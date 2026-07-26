@@ -71,14 +71,124 @@ export interface NodePerf {
   numCtx?: number;
   maxTokens?: number;
   keepAliveMinutes?: number;
+  /** Where the weights should live. See `Compute`. */
+  compute?: Compute;
+  /**
+   * Preferred GPU device order, most-preferred first.
+   *
+   * A PREFERENCE, not a live setting: applying it means the node restarts its
+   * runner with CUDA_VISIBLE_DEVICES set, because Ollama reads that once at
+   * start. `gpuOrderMatches` compares this against what the node reports so a
+   * pending change is visible instead of silently ignored.
+   */
+  gpuOrder?: number[];
+}
+
+/**
+ * CPU vs GPU, per node.
+ *
+ * Worth being precise, because the obvious mental model is wrong: GPU support
+ * is NOT a property of a model. Any GGUF can be offloaded — what decides it is
+ * whether the NODE has a supported GPU and whether the weights fit in its VRAM.
+ * So this lives on the node, and the model list is filtered by what fits rather
+ * than by a "gpu-capable" flag, which is not a real category.
+ *
+ * Maps to Ollama's `num_gpu`, the number of layers to offload:
+ *   cpu   → 0    every layer on CPU, even where a GPU exists
+ *   gpu   → 999  offload everything it can; Ollama clamps to what fits
+ *   auto  → omitted, and Ollama decides
+ *
+ * `auto` is the default because Ollama already knows the machine and this
+ * process does not.
+ */
+export type Compute = 'auto' | 'cpu' | 'gpu';
+
+/** Ollama's `num_gpu` for a choice, or undefined to let the server decide. */
+export function numGpuFor(compute: Compute | undefined): number | undefined {
+  if (compute === 'cpu') return 0;
+  if (compute === 'gpu') return 999;
+  return undefined;
 }
 
 /** What a probe learned about the machine behind an endpoint. */
 export interface NodeInfo {
   cores?: number;
   ramGb?: number;
+  /** Absent means "not known", which is different from "no GPU". */
+  gpu?: GpuInfo;
   /** Epoch ms, so stale information can be shown as stale. */
   seenAt?: number;
+}
+
+export interface GpuInfo {
+  available: boolean;
+  /** Summary name when there is one device, or a count when there are several. */
+  name?: string;
+  /** Total VRAM across selected devices. */
+  vramGb?: number;
+  /** Every device the node can see, in the node's own index order. */
+  devices?: GpuDevice[];
+  /**
+   * How the node is CURRENTLY ordered, as reported by it.
+   *
+   * Distinct from `NodePerf.gpuOrder`, which is what the user WANTS. The two
+   * differing is the interesting state — it means a preference has been set but
+   * the node has not applied it yet, and showing that is the whole point of
+   * keeping them separate.
+   */
+  activeOrder?: number[];
+}
+
+export interface GpuDevice {
+  /** Index as the driver enumerates it — what goes in CUDA_VISIBLE_DEVICES. */
+  index: number;
+  name: string;
+  vramGb?: number;
+  /** Free VRAM at probe time, when the node can measure it. */
+  freeGb?: number;
+  /** cuda | rocm | metal — different vendors need different env vars. */
+  backend?: string;
+}
+
+/**
+ * The env var a node must set to honour a device order, and its value.
+ *
+ * Returned rather than applied, because this is a SERVER-side setting: Ollama
+ * reads it once at start, so changing it means restarting the runner on the
+ * node. A client cannot do it per request, and pretending otherwise would
+ * produce a switch that silently does nothing.
+ *
+ * Order is significant, not just membership: `"1,0"` makes device 1 primary,
+ * which is how you steer a big model onto the larger card.
+ */
+export function gpuOrderEnv(
+  order: readonly number[] | undefined,
+  backend = 'cuda',
+): { name: string; value: string } | undefined {
+  if (!order || order.length === 0) return undefined;
+  const name =
+    backend === 'rocm' || backend === 'hip' ? 'ROCR_VISIBLE_DEVICES' : 'CUDA_VISIBLE_DEVICES';
+  return { name, value: order.join(',') };
+}
+
+/** True when the node's current order already matches what the user asked for. */
+export function gpuOrderMatches(want: readonly number[] | undefined, have: readonly number[] | undefined): boolean {
+  if (!want || want.length === 0) return true; // no preference — nothing to mismatch
+  if (!have) return false;
+  return want.length === have.length && want.every((v, i) => v === have[i]);
+}
+
+/**
+ * Whether a model of this size can be offloaded to the node's GPU.
+ *
+ * The rule of thumb is weights plus roughly 20% for the KV cache and the
+ * runtime's own allocations. Deliberately conservative: a model that only just
+ * fits gets partially offloaded, which is slower than pure CPU because every
+ * token then crosses the PCIe bus.
+ */
+export function fitsInVram(modelGb: number, gpu: GpuInfo | undefined): boolean {
+  if (!gpu?.available || !gpu.vramGb) return false;
+  return modelGb * 1.2 <= gpu.vramGb;
 }
 
 /** Threads for a remote node: its cores, not ours. */

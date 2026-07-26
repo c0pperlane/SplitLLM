@@ -13,6 +13,7 @@ import { showPerformancePanel } from './performance.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { addEndpoint, addEndpointInline, listEndpoints, testEndpoint, type Ask } from './endpoints-cmd.ts';
 import { EndpointRegistry, KIND_DEFAULTS, redact } from '../providers/endpoints.ts';
+import { probeEndpoint } from '../providers/factory.ts';
 import { coreCount, getSettings, threadsFor } from '../config/settings.ts';
 import { MODES, describeMode, type PermissionMode } from './permissions.ts';
 
@@ -105,6 +106,29 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
     // the list rebuilds.
     let itemIds: Array<string | undefined> = [];
 
+    // Probe state, filled in the background once the menu is up. 'unknown'
+    // until an endpoint answers for itself; rows render from this map.
+    const status = new Map<string, { state: 'online' | 'offline'; reason?: string }>();
+
+    const reprobe = (id: string): void => {
+      const ep = reg.get(id);
+      if (!ep || ep.enabled === false) return;
+      void probeEndpoint(ep, 8000)
+        .then((r) => {
+          if (r.ok) {
+            status.set(id, { state: 'online' });
+            // THE auto-refresh: stored cores/RAM follow the server's own
+            // /health answer, so a resized node stops looking stale in the
+            // perf panel without anyone pressing t.
+            if (r.node?.cores) reg.update(id, { node: r.node });
+          } else {
+            status.set(id, { state: 'offline', reason: `${r.stage}: ${r.reason}` });
+          }
+        })
+        .catch(() => status.set(id, { state: 'offline', reason: 'probe failed' }));
+    };
+    for (const ep of reg.list()) reprobe(ep.id);
+
     const build = (): MenuItem[] => {
       const eps = reg.list();
       if (eps.length === 0) {
@@ -119,20 +143,25 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
         ];
       }
       itemIds = eps.map((e) => e.id);
-      return eps.map((ep) => ({
-        label: `${ep.id === reg.activeId ? '● ' : '  '}${ep.id}`,
-        hint:
-          `${KIND_DEFAULTS[ep.kind].label} · ${ep.baseUrl} · key ${redact(ep.apiKey)}` +
-          (ep.node?.cores ? ` · ${ep.node.cores} cores` : ''),
-        value: () => `${ep.kind.padEnd(10)}${ep.model ?? color.grey('no model')}`,
-        run: async () => {
-          // Quiet on purpose: the ● marker moving IS the feedback, and printing
-          // a "using …" line per switch is what stacked frames on the screen.
-          reg.setActive(ep.id);
-          ctx.onEndpointChange(ep.id);
-          return 'stay' as const;
-        },
-      }));
+      return eps.map((ep) => {
+        const st = status.get(ep.id);
+        const offline = st?.state === 'offline';
+        return {
+          label: `${ep.id === reg.activeId ? '● ' : '  '}${offline ? color.mochaRed(ep.id) : ep.id}`,
+          hint: offline
+            ? color.mochaRed(`unreachable — ${st?.reason ?? 'probe failed'}`)
+            : `${KIND_DEFAULTS[ep.kind].label} · ${ep.baseUrl} · key ${redact(ep.apiKey)}` +
+              (ep.node?.cores ? ` · ${ep.node.cores} cores` : ''),
+          value: () => `${ep.kind.padEnd(10)}${ep.model ?? color.grey('no model')}`,
+          run: async () => {
+            // Quiet on purpose: the ● marker moving IS the feedback, and printing
+            // a "using …" line per switch is what stacked frames on the screen.
+            reg.setActive(ep.id);
+            ctx.onEndpointChange(ep.id);
+            return 'stay' as const;
+          },
+        };
+      });
     };
 
     let items = build();
@@ -163,8 +192,6 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
             console.log(color.grey('  select an endpoint first, then press p'));
             return 'stay';
           }
-          const ep = reg.find(target);
-          if (ep && !ep.node?.cores && ep.kind === 'splitllm') await testEndpoint(reg, ep.id);
           await showNodePerfPanel(reg, target, ctx.rl);
           if (reg.activeId === reg.find(target)?.id) ctx.onEndpointChange(reg.activeId);
           return 'stay' as const;

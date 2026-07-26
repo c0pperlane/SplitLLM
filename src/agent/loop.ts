@@ -66,6 +66,74 @@ interface ToolCall {
   function?: { name?: string; arguments?: unknown };
 }
 
+/**
+ * Reassemble one Ollama streaming reply into the non-streaming shape.
+ *
+ * Content arrives token by token; `tool_calls` arrive whole, on one chunk. Both
+ * are accumulated so the rest of the loop can stay written against a single
+ * finished message and does not need to know the transport changed.
+ *
+ * `thinking` is accumulated separately and deliberately NOT folded into
+ * content. On a hybrid reasoning model that ignores `think:false`, reasoning
+ * text shows up here; merging it into content would make the loop treat a
+ * monologue as the model's answer — which is exactly how a run ends with a
+ * plausible-looking summary and zero files written.
+ */
+async function collectStream(
+  stream: ReadableStream<Uint8Array>,
+  onProgress?: (chunk: string) => void,
+): Promise<{ message?: ChatMsg; error?: string; thinking?: string }> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  let thinking = '';
+  let toolCalls: ToolCall[] | undefined;
+  let error: string | undefined;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        let j: { message?: ChatMsg & { thinking?: string }; error?: string };
+        try {
+          j = JSON.parse(line);
+        } catch {
+          continue; // a server logging plain text mid-stream must not abort the read
+        }
+        if (j.error) error = j.error;
+        const piece = j.message?.content ?? '';
+        if (piece) {
+          content += piece;
+          onProgress?.(piece);
+        }
+        if (j.message?.thinking) thinking += j.message.thinking;
+        if (j.message?.tool_calls?.length) {
+          toolCalls = [...(toolCalls ?? []), ...j.message.tool_calls];
+        }
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released */
+    }
+  }
+
+  return {
+    error,
+    thinking: thinking || undefined,
+    message: { role: 'assistant', content, tool_calls: toolCalls },
+  };
+}
+
 interface ChatMsg {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
@@ -149,6 +217,8 @@ export interface AgentOptions {
    *  undefined means the builder decides, an empty string means no system
    *  message at all — which is a distinct condition worth being able to test. */
   systemOverride?: string;
+  /** Streamed token chunks, so a slow node shows progress instead of silence. */
+  onProgress?: (chunk: string) => void;
   onStep?: (s: AgentStep) => void;
   signal?: AbortSignal;
 }
@@ -267,8 +337,9 @@ export async function runAgent(
   for (let iter = 1; iter <= maxIterations; iter++) {
     if (opts.signal?.aborted) break;
 
-    let body: { message?: ChatMsg; error?: string };
+    let body: { message?: ChatMsg; error?: string; thinking?: string };
     try {
+      const remote = Boolean(opts.chatUrl);
       const res = await fetch(opts.chatUrl ?? `${HOST}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(opts.headers ?? {}) },
@@ -276,19 +347,33 @@ export async function runAgent(
           model,
           messages,
           tools: toolSpecs(),
-          stream: false,
+          // Streaming, so headers arrive at once and the socket keeps moving.
+          // With stream:false a slow node returns nothing until the whole
+          // generation finishes, and undici's 300s headers timeout kills the
+          // request mid-flight — while the server carries on generating, so the
+          // work is lost AND the next call queues behind it. Measured on a
+          // 6-core node at ~0.6 tok/s, where one turn exceeds that easily.
+          stream: true,
           think: false,
           keep_alive: '30m',
-          options: { num_thread: threadsFor(getSettings()), num_ctx: getSettings().numCtx, num_predict: 1200 },
+          options: {
+            // Thread count is a property of the machine doing the work. Sending
+            // this laptop's count to a remote node is meaningless at best and
+            // oversubscribes it at worst, so it is omitted for remote calls and
+            // the node applies its own.
+            ...(remote ? {} : { num_thread: threadsFor(getSettings()) }),
+            num_ctx: getSettings().numCtx,
+            num_predict: 1200,
+          },
         }),
         signal: opts.signal ?? AbortSignal.timeout(AGENT_TIMEOUT_MS),
       });
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         stopped = 'error';
         finalText = `Ollama returned HTTP ${res.status}`;
         break;
       }
-      body = (await res.json()) as { message?: ChatMsg; error?: string };
+      body = await collectStream(res.body, opts.onProgress);
     } catch (err) {
       stopped = 'error';
       finalText = err instanceof Error ? err.message : String(err);

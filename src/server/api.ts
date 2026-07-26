@@ -30,6 +30,7 @@ import { DEFAULT_THRESHOLDS, EFFORT_ORDER, type Effort } from '../router/thresho
 import { allowedCores, coreCount, getSettings, totalRamGb } from '../config/settings.ts';
 import { TokenAuth, presentedToken } from './auth.ts';
 import { RateLimiter, callerIp } from './limit.ts';
+import { enumerateGpus, type GpuReport } from './gpu.ts';
 import { installedNames, listServerModels, pullServerModel } from './models.ts';
 import { learn } from '../learn/orchestrator.ts';
 import type { ChatMessage } from '../providers/types.ts';
@@ -215,8 +216,60 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
     }
   }
 
+  /**
+   * Whether this node can actually offload to a GPU.
+   *
+   * Ollama has no "do you have a GPU" endpoint, so this reads `/api/ps`, which
+   * reports `size_vram` per loaded model — bytes actually resident in VRAM.
+   * Non-zero is proof of offload; zero with a model loaded is proof of none.
+   *
+   * With nothing loaded the answer is genuinely UNKNOWN, and that is reported
+   * as undefined rather than guessed as false. A client showing "this node has
+   * no GPU" because nothing happened to be loaded would be worse than saying
+   * nothing: the user would switch away from a setting that actually works.
+   */
+  async function detectGpu(): Promise<GpuReport | undefined> {
+    const devices = await enumerateGpus();
+    // Ordering is expressed by CUDA_VISIBLE_DEVICES, which Ollama reads once at
+    // start — so what the node is CURRENTLY using is whatever that env var said
+    // when the runner launched, not whatever a client last asked for.
+    const activeOrder = (process.env.CUDA_VISIBLE_DEVICES ?? process.env.ROCR_VISIBLE_DEVICES ?? '')
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n));
+
+    if (devices.length > 0) {
+      const total = devices.reduce((n, d) => n + (d.vramGb ?? 0), 0);
+      return {
+        available: true,
+        name: devices.length === 1 ? devices[0]!.name : `${devices.length} GPUs`,
+        vramGb: total > 0 ? Number(total.toFixed(1)) : undefined,
+        devices,
+        activeOrder: activeOrder.length ? activeOrder : undefined,
+      };
+    }
+
+    // No inventory tool available. Fall back to the only other evidence there
+    // is: whether a loaded model has bytes resident in VRAM.
+    try {
+      const host = (process.env.OLLAMA_HOST ?? 'http://localhost:11434').replace(/\/$/, '');
+      const r = await fetch(`${host}/api/ps`, { signal: AbortSignal.timeout(4000) });
+      if (!r.ok) return undefined;
+      const body = (await r.json()) as { models?: Array<{ size_vram?: number }> };
+      const loaded = body.models ?? [];
+      if (loaded.length === 0) return undefined; // nothing loaded — genuinely unknown
+      const vram = Math.max(...loaded.map((m) => m.size_vram ?? 0));
+      return vram > 0
+        ? { available: true, vramGb: Number((vram / 1e9).toFixed(1)) }
+        : { available: false };
+    } catch {
+      return undefined;
+    }
+  }
+
   async function getHealth(res: ServerResponse): Promise<void> {
     const avail = await provider.available();
+    const gpu = await detectGpu();
     const s = getSettings();
     sendJson(res, avail.ok ? 200 : 503, {
       status: avail.ok ? 'ok' : 'degraded',
@@ -232,6 +285,7 @@ export function createApi(opts: ServerOptions = {}): { server: Server; close: ()
       // machine instead of against the laptop it happens to be running on.
       // `cores` honours a container CPU quota; `hostCores` is what the box has,
       // and the gap between them is worth seeing when a container is throttled.
+      gpu,
       cores: allowedCores(),
       hostCores: coreCount(),
       ramGb: Number(totalRamGb().toFixed(1)),

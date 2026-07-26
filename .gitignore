@@ -23,3 +23,4 @@ nebula*.html
 site.html
 skeleton-test.html
 shot-*.png
+deploy/.env

@@ -1,0 +1,29 @@
+# GPU overlay. Applied ON TOP of docker-compose.yml, never instead of it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Kept as a separate file rather than a flag inside the base compose, because a
+# `devices` reservation for a GPU that the runtime cannot provide makes the
+# container refuse to start outright. A node with no GPU, or with a GPU that
+# Docker cannot pass through, must still come up and run on CPU — so the base
+# file stays universally valid and this is layered on only once `install.sh` has
+# PROVEN passthrough works by actually running nvidia-smi inside a container.
+services:
+  splitllm:
+    environment:
+      # Ollama reads this once at start, which is why GPU ordering is a node
+      # setting and not a per-request option. Order is significant: "1,0" makes
+      # device 1 primary, which is how a large model is steered onto the bigger
+      # card. Set by the CLI's per-node GPU order, applied here.
+      CUDA_VISIBLE_DEVICES: ${SPLITLLM_GPU_ORDER:-all}
+      # Spread layers across every visible device rather than filling the first.
+      # Off by default: for a model that fits on one card, spreading it adds a
+      # PCIe hop per token and is slower.
+      OLLAMA_SCHED_SPREAD: ${SPLITLLM_GPU_SPREAD:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${SPLITLLM_GPU_COUNT:-all}
+              capabilities: [gpu]
