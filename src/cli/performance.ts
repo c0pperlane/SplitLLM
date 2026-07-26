@@ -24,6 +24,7 @@ import {
   type Settings,
 } from '../config/settings.ts';
 import { color } from './debug.ts';
+import { KeyReader, physicalRows } from './menu.ts';
 
 const ESC = '\x1b';
 
@@ -117,13 +118,14 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
   stdin.setRawMode(true);
   stdin.resume();
   stdin.setEncoding('utf8');
+  const reader = new KeyReader(stdin);
 
   let lastHeight = 0;
   const draw = (): void => {
     if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
     const frame = render(working, cursor, dirty);
     stdout.write(frame + '\n');
-    lastHeight = frame.split('\n').length + 1;
+    lastHeight = physicalRows(frame) + 1;
   };
 
   const adjust = (dir: 1 | -1): void => {
@@ -139,65 +141,53 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
     dirty = JSON.stringify(working) !== JSON.stringify(original);
   };
 
-  return new Promise<Settings>((resolvePanel) => {
-    const cleanup = (): void => {
-      stdin.removeListener('data', onKey);
-      try {
-        stdin.setRawMode(wasRaw);
-      } catch {
-        /* terminal may already be gone */
-      }
-      stdin.pause();
-      rl.resume();
-    };
-
-    const onKey = (key: string): void => {
-      try {
-        switch (key) {
-          case `${ESC}[A`: // up
-            cursor = (cursor - 1 + specs.length) % specs.length;
-            break;
-          case `${ESC}[B`: // down
-            cursor = (cursor + 1) % specs.length;
-            break;
-          case `${ESC}[C`: // right
-            adjust(1);
-            break;
-          case `${ESC}[D`: // left
-            adjust(-1);
-            break;
-          case 'r':
-          case 'R':
-            working = defaultSettings();
-            dirty = JSON.stringify(working) !== JSON.stringify(original);
-            break;
-          case '\r':
-          case '\n':
-            saveSettings(working);
-            cleanup();
-            stdout.write(color.green('  performance settings applied\n'));
-            resolvePanel(working);
-            return;
-          case ESC:
-          case 'q':
-          case '\x03': // Ctrl-C
-            cleanup();
-            stdout.write(color.grey('  cancelled — no changes\n'));
-            resolvePanel(original);
-            return;
-          default:
-            return; // ignore anything else without redrawing
-        }
-        draw();
-      } catch {
-        cleanup();
-        resolvePanel(original);
-      }
-    };
-
-    stdin.on('data', onKey);
+  try {
     draw();
-  });
+    for (;;) {
+      const key = await reader.next();
+      switch (key) {
+        case `${ESC}[A`: // up
+          cursor = (cursor - 1 + specs.length) % specs.length;
+          break;
+        case `${ESC}[B`: // down
+          cursor = (cursor + 1) % specs.length;
+          break;
+        case `${ESC}[C`: // right
+          adjust(1);
+          break;
+        case `${ESC}[D`: // left
+          adjust(-1);
+          break;
+        case 'r':
+        case 'R':
+          working = defaultSettings();
+          dirty = JSON.stringify(working) !== JSON.stringify(original);
+          break;
+        case '\r':
+        case '\n':
+          saveSettings(working);
+          stdout.write(color.green('  performance settings applied\n'));
+          return working;
+        case ESC:
+        case 'q':
+        case '\x03': // Ctrl-C
+          stdout.write(color.grey('  cancelled — no changes\n'));
+          return original;
+        default:
+          continue; // ignore anything else without redrawing
+      }
+      draw();
+    }
+  } finally {
+    reader.dispose();
+    try {
+      stdin.setRawMode(wasRaw);
+    } catch {
+      /* terminal may already be gone */
+    }
+    stdin.pause();
+    rl.resume();
+  }
 }
 
 /** One-line summary for the banner and `/stats`. */

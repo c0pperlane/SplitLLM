@@ -18,7 +18,9 @@
  */
 
 import { stdin, stdout } from 'node:process';
+import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
+import { KeyReader, physicalRows } from './menu.ts';
 import {
   EndpointRegistry,
   type Endpoint,
@@ -158,7 +160,11 @@ function render(ep: Endpoint, perf: NodePerf, cursor: number, dirty: boolean): s
 }
 
 /** Show the panel for one endpoint. Resolves with the perf in force on exit. */
-export async function showNodePerfPanel(reg: EndpointRegistry, id: string): Promise<NodePerf | undefined> {
+export async function showNodePerfPanel(
+  reg: EndpointRegistry,
+  id: string,
+  rl?: Pick<Interface, 'pause' | 'resume'>,
+): Promise<NodePerf | undefined> {
   const ep = reg.find(id);
   if (!ep) {
     console.log(color.red(`  no endpoint matching '${id}'`));
@@ -177,17 +183,19 @@ export async function showNodePerfPanel(reg: EndpointRegistry, id: string): Prom
     return working;
   }
 
+  rl?.pause();
   const wasRaw = stdin.isRaw ?? false;
   stdin.setRawMode(true);
   stdin.resume();
   stdin.setEncoding('utf8');
+  const reader = new KeyReader(stdin);
 
   let lastHeight = 0;
   const draw = (): void => {
     if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
     const frame = render(ep, working, cursor, dirty);
     stdout.write(`${frame}\n`);
-    lastHeight = frame.split('\n').length + 1;
+    lastHeight = physicalRows(frame) + 1;
   };
 
   const adjust = (dir: 1 | -1): void => {
@@ -200,72 +208,61 @@ export async function showNodePerfPanel(reg: EndpointRegistry, id: string): Prom
     dirty = JSON.stringify(working) !== JSON.stringify(original);
   };
 
-  return new Promise<NodePerf>((resolvePanel) => {
-    const cleanup = (): void => {
-      stdin.removeListener('data', onKey);
-      try {
-        stdin.setRawMode(wasRaw);
-      } catch {
-        /* terminal may already be gone */
-      }
-      stdin.pause();
-    };
-
-    const onKey = (key: string): void => {
-      try {
-        switch (key) {
-          case `${ESC}[A`:
-            cursor = (cursor - 1 + specs.length) % specs.length;
-            break;
-          case `${ESC}[B`:
-            cursor = (cursor + 1) % specs.length;
-            break;
-          case `${ESC}[C`:
-            adjust(1);
-            break;
-          case `${ESC}[D`:
-            adjust(-1);
-            break;
-          case 'r':
-          case 'R':
-            working = {};
-            dirty = JSON.stringify(working) !== JSON.stringify(original);
-            break;
-          case '\r':
-          case '\n': {
-            // Drop AUTO entries entirely rather than persisting -1, so the
-            // stored record says "unset" instead of encoding a sentinel that a
-            // future reader would have to know about.
-            const clean: NodePerf = {};
-            for (const [k, v] of Object.entries(working)) {
-              if (typeof v === 'number' && v >= 0) (clean as Record<string, number>)[k] = v;
-            }
-            reg.update(ep.id, { perf: clean });
-            cleanup();
-            stdout.write(color.green(`  ${ep.id}: node settings applied\n`));
-            resolvePanel(clean);
-            return;
-          }
-          case ESC:
-          case 'q':
-          case '\x03':
-            cleanup();
-            stdout.write(color.grey('  cancelled — no changes\n'));
-            resolvePanel(original);
-            return;
-          default:
-            return;
-        }
-        draw();
-      } catch {
-        cleanup();
-        resolvePanel(original);
-      }
-    };
-
-    stdin.on('data', onKey);
+  try {
     draw();
-  });
+    for (;;) {
+      const key = await reader.next();
+      switch (key) {
+        case `${ESC}[A`:
+          cursor = (cursor - 1 + specs.length) % specs.length;
+          break;
+        case `${ESC}[B`:
+          cursor = (cursor + 1) % specs.length;
+          break;
+        case `${ESC}[C`:
+          adjust(1);
+          break;
+        case `${ESC}[D`:
+          adjust(-1);
+          break;
+        case 'r':
+        case 'R':
+          working = {};
+          dirty = JSON.stringify(working) !== JSON.stringify(original);
+          break;
+        case '\r':
+        case '\n': {
+          // Drop AUTO entries entirely rather than persisting -1, so the
+          // stored record says "unset" instead of encoding a sentinel that a
+          // future reader would have to know about.
+          const clean: NodePerf = {};
+          for (const [k, v] of Object.entries(working)) {
+            if (typeof v === 'number' && v >= 0) (clean as Record<string, number>)[k] = v;
+          }
+          reg.update(ep.id, { perf: clean });
+          stdout.write(color.green(`  ${ep.id}: node settings applied\n`));
+          return clean;
+        }
+        case ESC:
+        case 'q':
+        case '\x03':
+          stdout.write(color.grey('  cancelled — no changes\n'));
+          return original;
+        default:
+          continue;
+      }
+      draw();
+    }
+  } finally {
+    reader.dispose();
+    try {
+      stdin.setRawMode(wasRaw);
+    } catch {
+      /* terminal may already be gone */
+    }
+    stdin.pause();
+    rl?.resume();
+  }
 }
 
 /** One-line summary for `/endpoint` listings. */

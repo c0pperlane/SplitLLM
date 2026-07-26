@@ -37,6 +37,7 @@ export async function runSettingsMenu(ctx: SettingsCtx): Promise<void> {
     await runMenu({
       title: 'SETTINGS',
       subtitle: 'Enter opens · Esc closes',
+      rl: ctx.rl,
       items: [
         {
           label: 'Performance',
@@ -99,11 +100,15 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
   const reg = ctx.endpoints;
   ctx.pauseBar();
   try {
-    let cursorId: string | undefined;
+    // The menu's letter keys act on the HIGHLIGHTED row, so the id has to be
+    // tracked alongside the items — the cursor index alone says nothing once
+    // the list rebuilds.
+    let itemIds: Array<string | undefined> = [];
 
     const build = (): MenuItem[] => {
       const eps = reg.list();
       if (eps.length === 0) {
+        itemIds = [undefined];
         return [
           {
             label: '(no endpoints)',
@@ -113,6 +118,7 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
           },
         ];
       }
+      itemIds = eps.map((e) => e.id);
       return eps.map((ep) => ({
         label: `${ep.id === reg.activeId ? '● ' : '  '}${ep.id}`,
         hint:
@@ -120,7 +126,8 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
           (ep.node?.cores ? ` · ${ep.node.cores} cores` : ''),
         value: () => `${ep.kind.padEnd(10)}${ep.model ?? color.grey('no model')}`,
         run: async () => {
-          cursorId = ep.id;
+          // Quiet on purpose: the ● marker moving IS the feedback, and printing
+          // a "using …" line per switch is what stacked frames on the screen.
           reg.setActive(ep.id);
           ctx.onEndpointChange(ep.id);
           return 'stay' as const;
@@ -134,6 +141,7 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
       subtitle: 'Enter = use it   a add   t test   p per-node performance   r remove   l local only',
       footer: '↑/↓ move   Enter use   a/t/p/r/l act   Esc back',
       items,
+      rl: ctx.rl,
       refresh: () => {
         const next = build();
         items.length = 0;
@@ -145,31 +153,30 @@ export async function runEndpointsMenu(ctx: SettingsCtx): Promise<void> {
           if (ep && reg.activeId === ep.id) ctx.onEndpointChange(ep.id);
           return 'stay' as const;
         },
-        t: async () => {
-          await testEndpoint(reg, cursorId ?? reg.activeId ?? 'all');
+        t: async (cur) => {
+          await testEndpoint(reg, itemIds[cur] ?? reg.activeId ?? 'all');
           return 'stay' as const;
         },
-        p: async () => {
-          const target = cursorId ?? reg.activeId;
+        p: async (cur) => {
+          const target = itemIds[cur] ?? reg.activeId;
           if (!target) {
-            console.log(color.grey('  select an endpoint first (Enter), then press p'));
+            console.log(color.grey('  select an endpoint first, then press p'));
             return 'stay';
           }
           const ep = reg.find(target);
           if (ep && !ep.node?.cores && ep.kind === 'splitllm') await testEndpoint(reg, ep.id);
-          await showNodePerfPanel(reg, target);
+          await showNodePerfPanel(reg, target, ctx.rl);
           if (reg.activeId === reg.find(target)?.id) ctx.onEndpointChange(reg.activeId);
           return 'stay' as const;
         },
-        r: async () => {
-          const target = cursorId ?? reg.activeId;
+        r: async (cur) => {
+          const target = itemIds[cur] ?? reg.activeId;
           if (!target) return 'stay';
           const ep = reg.find(target);
           if (!ep) return 'stay';
           const yes = (await ctx.ask(`  remove '${ep.id}'? [y/N] `)).trim().toLowerCase();
           if (yes === 'y' || yes === 'yes') {
             reg.remove(ep.id);
-            cursorId = undefined;
             console.log(color.green(`  removed '${ep.id}'`));
             ctx.onEndpointChange(reg.activeId);
           }
@@ -191,6 +198,7 @@ async function runDebugMenu(ctx: SettingsCtx): Promise<void> {
   await runMenu({
     title: 'DEBUG',
     subtitle: 'what the CLI shows about its own decisions',
+    rl: ctx.rl,
     items: [
       {
         label: 'Show reasoning',
@@ -227,6 +235,7 @@ async function runPermissionsMenu(ctx: SettingsCtx): Promise<void> {
   await runMenu({
     title: 'PERMISSIONS',
     subtitle: 'what the agent may do without asking each time',
+    rl: ctx.rl,
     items: MODES.map((m) => ({
       label: m,
       hint: describeMode(m),

@@ -277,7 +277,9 @@ function settingsCtx(ctx: Ctx): SettingsCtx {
     rl: ctx.rl,
     ask: async (p) => (await ctx.lines.next(p)) ?? '',
     endpoints: ctx.endpoints,
-    onEndpointChange: (id) => switchToEndpoint(ctx, id),
+    // Menus get the quiet switch: their ● marker already shows the change, and
+    // a printed confirmation per selection is what stacked frames on screen.
+    onEndpointChange: (id) => switchToEndpoint(ctx, id, { quiet: true }),
     getShowThinking: () => ctx.session.showThinking,
     setShowThinking: (v) => {
       ctx.session.showThinking = v;
@@ -304,12 +306,12 @@ function designProvider(ctx: Ctx): OllamaProvider {
   return new OllamaProvider();
 }
 
-function switchToEndpoint(ctx: Ctx, id: string | undefined): void {
+function switchToEndpoint(ctx: Ctx, id: string | undefined, opts?: { quiet?: boolean }): void {
   const ep = id ? ctx.endpoints.get(id) : undefined;
   if (!ep) {
     ctx.provider.current = new OllamaProvider();
     ctx.session.caps = undefined;
-    console.log(color.green(`  using local ollama · ${ctx.provider.current.model}`));
+    if (!opts?.quiet) console.log(color.green(`  using local ollama · ${ctx.provider.current.model}`));
     void (asOllama(ctx.provider.current)?.preload());
     return;
   }
@@ -318,10 +320,12 @@ function switchToEndpoint(ctx: Ctx, id: string | undefined): void {
   // remote endpoint, so `caps` is cleared rather than left describing a model
   // that is no longer the one answering.
   ctx.session.caps = undefined;
-  console.log(color.green(`  using ${ep.id} (${ep.kind}) · ${ep.model ?? 'no default model'}`));
-  console.log(color.grey(`    ${ep.baseUrl}`));
-  if (KIND_DEFAULTS[ep.kind].needsKey && !ep.apiKey) {
-    console.log(color.yellow('  ! no API key set — requests will very likely be rejected'));
+  if (!opts?.quiet) {
+    console.log(color.green(`  using ${ep.id} (${ep.kind}) · ${ep.model ?? 'no default model'}`));
+    console.log(color.grey(`    ${ep.baseUrl}`));
+    if (KIND_DEFAULTS[ep.kind].needsKey && !ep.apiKey) {
+      console.log(color.yellow('  ! no API key set — requests will very likely be rejected'));
+    }
   }
 }
 
@@ -387,7 +391,7 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
           if (ep && !ep.node?.cores && ep.kind === 'splitllm') await testEndpoint(reg, ep.id);
           ctx.bar.pause();
           try {
-            await showNodePerfPanel(reg, target);
+            await showNodePerfPanel(reg, target, ctx.rl);
           } finally {
             ctx.bar.resume();
           }
