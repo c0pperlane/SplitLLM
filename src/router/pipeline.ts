@@ -26,7 +26,15 @@ export interface RouteTrace {
   entitySource: 'model' | 'deterministic';
   retrieval: RetrievalTrace;
   /** Raw absolute-relevance signals behind the gate decision. */
-  signals: { topCosine: number; topBm25: number; medianCosine: number; retrieversAgree: boolean };
+  signals: {
+    topCosine: number;
+    topBm25: number;
+    medianCosine: number;
+    retrieversAgree: boolean;
+    topBm25Rare: number;
+    topExact: number;
+    rareTokens: string[];
+  };
   seeds: SeedDecision[];
   activation: ActivationResult;
   demoted: Array<{ id: number; inFavourOf: number; reason: string }>;
@@ -92,6 +100,9 @@ export async function route(
     topBm25: topLex?.score ?? 0,
     medianCosine: retrieval.medianCosine,
     retrieversAgree: !!topVec && !!topLex && topVec.id === topLex.id,
+    topBm25Rare: retrieval.bm25Rare[0]?.score ?? 0,
+    topExact: retrieval.exact[0]?.score ?? 0,
+    rareTokens: retrieval.rareTokens,
   };
   const seeds = await clock('seed', () =>
     applySeedGate(retrieval.fused, signals, {

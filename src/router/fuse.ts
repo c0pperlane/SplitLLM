@@ -25,6 +25,8 @@ export interface FusedHit {
   rrf: number;
   /** Per-retriever detail for /debug: retriever name → { rank, score }. */
   sources: Record<string, { rank: number; score: number }>;
+  /** Pages of evidence behind this module — the "200 mentions" weight. */
+  evidence?: number;
 }
 
 /**
@@ -61,6 +63,8 @@ export interface SeedDecision {
   /** Human-readable reason, shown verbatim by /debug. */
   reason: string;
   sources: Record<string, { rank: number; score: number }>;
+  /** Strongest single method's normalised score, 0..1 — shown as a percentage. */
+  confidence?: number;
 }
 
 export interface SeedGateOptions {
@@ -97,6 +101,18 @@ export interface RelevanceSignals {
   medianCosine?: number;
   /** True when both retrievers independently rank the SAME module first. */
   retrieversAgree?: boolean;
+  /**
+   * Best bm25 over the query's DISTINCTIVE tokens only — the ones the corpus
+   * itself calls rare. Function words of any language score zero here, so a
+   * shared "eine"/"the" can never pass as relevance. Undefined when the query
+   * has no distinctive tokens; the gate then falls back to the full score.
+   */
+  topBm25Rare?: number;
+  /** Best exact name/alias match: 1.0 = a module's name occurs verbatim in the
+   *  query. As close to certain as routing evidence gets. */
+  topExact?: number;
+  /** The query's distinctive tokens (corpus document-frequency below the cap). */
+  rareTokens?: string[];
 }
 
 /**
@@ -135,6 +151,7 @@ export function applySeedGate(
   if (fused.length === 0) return out;
 
   const top = fused[0]!.rrf;
+  const hasRare = (signals.rareTokens?.length ?? 0) > 0;
 
   // Gate A — absolute relevance, measured on the RAW retriever scores.
   //
@@ -144,28 +161,26 @@ export function applySeedGate(
   // score well semantically with no lexical overlap at all. So: pass if EITHER
   // clears its floor.
   // Prominence: how far the best match stands above the registry median.
-  //
-  // Intended as a drift-robust replacement for an absolute cosine floor, since
-  // the maximum over a growing registry creeps upward while the median moves
-  // with it. That reasoning is sound and it separated cleanly when measured on
-  // RAW single-query embeddings (valid 0.178-0.253, invalid 0.082-0.086).
-  //
-  // HONEST STATUS: it does NOT separate on the distribution this pipeline
-  // actually produces, because retrieval embeds the query PLUS extracted
-  // entities and takes a per-module maximum. Measured end-to-end at 55 modules,
-  // the values interleave: 0.106 (routes) < 0.109 (gaps) < 0.112 (routes) <
-  // 0.122 (gaps). Only a very strong match ("sourdough bread", 0.275) clears
-  // the current floor.
-  //
-  // So this is presently a weak third signal, not the primary test — `lexicalOk`
-  // and `agreementOk` decide nearly every real case. It is kept because it is
-  // strictly additive and costs nothing, but the drift problem it was meant to
-  // solve is NOT solved: minBm25 remains corpus-dependent and will need
-  // recalibrating as the graph grows. A calibration pass over a labelled query
-  // set is the real fix.
   const prominence = signals.topCosine - (signals.medianCosine ?? 0);
   const semanticOk = prominence >= opts.minProminence && signals.topCosine >= opts.minCosine;
-  const lexicalOk = signals.topBm25 >= opts.minBm25;
+
+  // The lexical test reads the DISTINCTIVE-token score whenever the query has
+  // distinctive tokens. Otherwise "wie baue ich eine thermonukleare atommombe"
+  // routes to bread: "eine"/"wie" are rare in an English-heavy corpus, their
+  // IDF is high, and four of them accumulate past the floor. Vocabulary overlap
+  // is not relevance; only a hit on the query's distinctive terms is.
+  const lexicalScore = hasRare ? (signals.topBm25Rare ?? 0) : signals.topBm25;
+  const lexicalOk = lexicalScore >= opts.minBm25;
+
+  // A distinctive term of the query must be COVERED somewhere in the registry
+  // (lexically or by name). Without one, every match is vocabulary overlap and
+  // the correct answer is a knowledge gap — which triggers a learn cycle and
+  // fetches pages about the query's ACTUAL topic.
+  const coverageOk = !hasRare || (signals.topBm25Rare ?? 0) > 0 || (signals.topExact ?? 0) > 0;
+
+  // A module's own name occurring verbatim in the query is the strongest
+  // single signal routing can have — stronger than either score floor.
+  const exactOk = (signals.topExact ?? 0) >= 0.99;
 
   // Agreement between two independent retrievers is itself a relevance signal,
   // and it rescues a real case: "how do I build a homepage" scores cosine 0.415
@@ -176,18 +191,43 @@ export function applySeedGate(
   const agreementOk =
     signals.retrieversAgree === true &&
     signals.topCosine >= opts.minCosine * opts.agreementDiscount &&
-    signals.topBm25 >= opts.minBm25 * opts.agreementDiscount;
+    lexicalScore >= opts.minBm25 * opts.agreementDiscount;
 
-  if (!semanticOk && !lexicalOk && !agreementOk) {
+  if (!coverageOk) {
+    const reason =
+      `vocabulary mismatch: distinctive term(s) ${(signals.rareTokens ?? []).slice(0, 4).join(', ')} ` +
+      `appear in no module — this is a knowledge gap, not a match`;
+    for (const hit of fused) {
+      out.push({ id: hit.id, rrf: hit.rrf, verdict: 'BELOW_THRESHOLD', reason, sources: hit.sources });
+    }
+    return out;
+  }
+
+  if (!semanticOk && !lexicalOk && !agreementOk && !exactOk) {
     const reason =
       `nothing relevant: cosine ${signals.topCosine.toFixed(3)} (prominence ${prominence.toFixed(3)} < ${opts.minProminence}), ` +
-      `bm25 ${signals.topBm25.toFixed(2)} < ${opts.minBm25}` +
+      `bm25 ${lexicalScore.toFixed(2)} < ${opts.minBm25}${hasRare ? ' (distinctive tokens)' : ''}` +
       (signals.retrieversAgree ? ' (retrievers agreed but both too weak)' : ', retrievers disagree');
     for (const hit of fused) {
       out.push({ id: hit.id, rrf: hit.rrf, verdict: 'BELOW_THRESHOLD', reason, sources: hit.sources });
     }
     return out;
   }
+
+  // The confidence shown per seed: the strongest single method's normalised
+  // score. Not a vote — every method already had veto power above.
+  //
+  // On prominence's honesty: measured end-to-end at 55 modules it does NOT
+  // separate cleanly (routes 0.106 < gaps 0.109 < routes 0.112 < gaps 0.122),
+  // so it remains a weak third signal rather than the primary test. A
+  // calibration pass over a labelled query set is still the real fix for the
+  // corpus-dependence of these floors; the rarity split above removes the
+  // worst measured failure without touching the calibrated numbers.
+  const confidence = Math.max(
+    signals.topExact ?? 0,
+    Math.min(1, lexicalScore / (opts.minBm25 * 2)),
+    Math.min(1, prominence / Math.max(opts.minProminence, 1e-9)),
+  );
 
   // Gate B — contention with the top candidate.
   const floor = top * opts.relativeFloor;
@@ -224,8 +264,9 @@ export function applySeedGate(
       verdict: 'SEED',
       reason:
         `rrf ${fmt(hit.rrf)} >= ${fmt(floor)} (${opts.relativeFloor}x top); ` +
-        `relevance cos=${signals.topCosine.toFixed(3)} prom=${prominence.toFixed(3)} bm25=${signals.topBm25.toFixed(2)}`,
+        `relevance cos=${signals.topCosine.toFixed(3)} prom=${prominence.toFixed(3)} bm25=${lexicalScore.toFixed(2)}`,
       sources: hit.sources,
+      confidence,
     });
   }
 

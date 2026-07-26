@@ -7,7 +7,8 @@
  * exact rare tokens ("bcmath"). Neither alone is reliable.
  */
 
-import type { GraphDb } from '../graph/db.ts';
+import type { GraphDb, ModuleRow } from '../graph/db.ts';
+import { tokenizeFts } from '../graph/db.ts';
 import type { EmbeddingProvider } from '../providers/types.ts';
 import { cosine, reciprocalRankFusion, type FusedHit, type RankedHit } from './fuse.ts';
 
@@ -18,6 +19,10 @@ export interface RetrieveOptions {
 
 export interface RetrievalTrace {
   bm25: RankedHit[];
+  /** bm25 restricted to the query's distinctive tokens — vocabulary, not noise. */
+  bm25Rare: RankedHit[];
+  /** Verbatim module name/alias occurrences in the query. */
+  exact: RankedHit[];
   vector: RankedHit[];
   fused: FusedHit[];
   embeddingUsed: boolean;
@@ -32,8 +37,20 @@ export interface RetrievalTrace {
    *  The median moves with the registry, so `top - median` stays meaningful at
    *  any size. */
   medianCosine: number;
+  /** Query tokens the corpus itself calls distinctive (low module doc-freq). */
+  rareTokens: string[];
   note?: string;
 }
+
+/** A token is distinctive when at most this many modules contain it at all. */
+const RARE_DF_MIN = 2;
+const RARE_DF_FRACTION = 0.05;
+/**
+ * Evidence weight: fused score × (1 + α·log1p(docs)). A module backed by 200
+ * pages scores ~+42% against one backed by 1 page (+0.6%) — evidence breaks
+ * contention, it never creates a match.
+ */
+const EVIDENCE_ALPHA = 0.08;
 
 /**
  * Retrieve candidates for a set of query strings.
@@ -61,6 +78,24 @@ export async function retrieveCandidates(
     .map(([id, score]) => ({ id, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, opts.topK);
+
+  // --- Distinctive tokens, learned from the corpus itself -------------------
+  //
+  // "Stopwords" cannot be a list: the corpus learns pages in whatever language
+  // the user asks about, so "eine" is as load-bearing as "the" and just as
+  // meaningless for routing. The registry's own document-frequency is the
+  // honest measure: a token nearly every module contains carries no
+  // information; a token in zero-to-few modules is the query's fingerprint.
+  const allModules = db.allModules();
+  const tokens = [...new Set(queries.flatMap((q) => tokenizeFts(q)))].slice(0, 24);
+  const df = db.moduleDocFreq(tokens);
+  const rareCap = Math.max(RARE_DF_MIN, Math.floor(Math.max(1, allModules.length) * RARE_DF_FRACTION));
+  const rareTokens = tokens.filter((t) => (df.get(t) ?? 0) <= rareCap);
+
+  const bm25Rare: RankedHit[] = rareTokens.length > 0 ? db.searchFts(rareTokens.join(' '), opts.topK) : [];
+
+  // --- Exact name/alias occurrences ------------------------------------------
+  const exact = exactNameHits(allModules, queries[0] ?? '');
 
   let vectorList: RankedHit[] = [];
   let embeddingUsed = false;
@@ -98,12 +133,53 @@ export async function retrieveCandidates(
     note = 'no embeddings indexed yet — run /reindex for semantic retrieval';
   }
 
-  const fused = reciprocalRankFusion(
-    embeddingUsed ? { bm25: bm25List, vector: vectorList } : { bm25: bm25List },
-    opts.rrfK,
-  );
+  const lists: Record<string, RankedHit[]> = { bm25: bm25List };
+  if (bm25Rare.length > 0) lists.bm25Rare = bm25Rare;
+  if (exact.length > 0) lists.exact = exact;
+  if (embeddingUsed) lists.vector = vectorList;
+  const fused = reciprocalRankFusion(lists, opts.rrfK);
 
-  return { bm25: bm25List, vector: vectorList, fused, embeddingUsed, medianCosine, note };
+  // Evidence weighting: a module backed by many learned pages wins contention
+  // against a thinly-sourced one ("nuclear, 200 mentions" over "dough, 1 page")
+  // — a multiplier on rank mass, so it reorders matches but mints none.
+  for (const hit of fused) {
+    const d = docsOf(allModules, hit.id);
+    hit.rrf *= 1 + EVIDENCE_ALPHA * Math.log1p(d);
+    hit.evidence = d;
+  }
+  fused.sort((a, b) => b.rrf - a.rrf || a.id - b.id);
+
+  return { bm25: bm25List, bm25Rare, exact, vector: vectorList, fused, embeddingUsed, medianCosine, rareTokens, note };
+}
+
+function docsOf(modules: readonly ModuleRow[], id: number): number {
+  // allModules is sorted by name, not id — linear scan is fine at this size.
+  return modules.find((m) => m.id === id)?.n_docs ?? 0;
+}
+
+/**
+ * Verbatim module names and aliases in the query text.
+ *
+ * "redis connection refused" contains the module name `redis` — the most
+ * precise routing signal that exists, and free to compute. Alias hits count
+ * slightly less (0.8): they are a name the module is known by, not the name.
+ */
+export function exactNameHits(modules: readonly ModuleRow[], rawQuery: string): RankedHit[] {
+  const padded = ` ${rawQuery.toLowerCase().replace(/[^a-z0-9+#.\-_]+/g, ' ').replace(/\s+/g, ' ')} `;
+  const hits: RankedHit[] = [];
+  for (const m of modules) {
+    const names = [m.name, ...m.aliases.split(/[,;|]/).map((a) => a.trim()).filter(Boolean)];
+    let best = 0;
+    for (const n of names) {
+      const name = n.toLowerCase();
+      if (name.length < 3) continue;
+      if (padded.includes(` ${name} `)) {
+        best = Math.max(best, name === m.name.toLowerCase() ? 1 : 0.8);
+      }
+    }
+    if (best > 0) hits.push({ id: m.id, score: best });
+  }
+  return hits.sort((a, b) => b.score - a.score || a.id - b.id);
 }
 
 /** Text used to embed a module. Kept stable so stored vectors stay comparable. */

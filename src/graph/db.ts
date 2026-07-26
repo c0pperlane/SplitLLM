@@ -285,6 +285,29 @@ export class GraphDb {
     }
   }
 
+  /**
+   * Module document-frequency per token: in how many modules does this token
+   * appear at all. This is the corpus's own measure of how *distinctive* a
+   * term is — a word shared by many modules (function words of whatever
+   * language the last learn cycle scraped) carries no routing information,
+   * and no hand-written stopword list can tell it from one that does.
+   */
+  moduleDocFreq(tokens: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    const stmt = this.db.prepare('SELECT COUNT(*) AS c FROM module_fts WHERE module_fts MATCH ?');
+    for (const t of new Set(tokens)) {
+      const match = ftsQuery(t);
+      if (!match) continue;
+      try {
+        const r = stmt.get(match) as { c: number };
+        out.set(t, r.c);
+      } catch {
+        out.set(t, 0);
+      }
+    }
+    return out;
+  }
+
   // -------------------------------------------------------------------------
   // Edges
   // -------------------------------------------------------------------------
@@ -506,15 +529,19 @@ export class GraphDb {
  * bm25 then ranks documents matching more of them higher.
  */
 export function ftsQuery(raw: string): string | undefined {
-  const tokens = raw
+  const tokens = tokenizeFts(raw);
+  if (tokens.length === 0) return undefined;
+  const uniq = [...new Set(tokens)].slice(0, 24);
+  return uniq.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+}
+
+/** The tokenizer behind ftsQuery, exported so rarity can be measured per token. */
+export function tokenizeFts(raw: string): string[] {
+  return raw
     .toLowerCase()
     .split(/[^a-z0-9_+#.-]+/)
     .map((t) => t.replace(/^[-.]+|[-.]+$/g, ''))
     .filter((t) => t.length >= 2);
-
-  if (tokens.length === 0) return undefined;
-  const uniq = [...new Set(tokens)].slice(0, 24);
-  return uniq.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
 }
 
 /** Default on-disk location for the graph. */

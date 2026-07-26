@@ -73,10 +73,14 @@ export function renderTrace(db: GraphDb, trace: RouteTrace): string {
   if (trace.retrieval.note) L.push(`  ${color.yellow(trace.retrieval.note)}`);
   L.push(
     color.dim(
-      `  bm25: ${trace.retrieval.bm25.length} hits · vector: ${trace.retrieval.vector.length} hits` +
+      `  bm25: ${trace.retrieval.bm25.length} hits · distinctive-bm25: ${trace.retrieval.bm25Rare.length}` +
+        ` · exact-name: ${trace.retrieval.exact.length} · vector: ${trace.retrieval.vector.length} hits` +
         ` · embeddings ${trace.retrieval.embeddingUsed ? 'used' : 'not used'}`,
     ),
   );
+  if (trace.retrieval.rareTokens.length > 0) {
+    L.push(color.dim(`  distinctive terms: ${trace.retrieval.rareTokens.join(', ')}`));
+  }
   for (const f of trace.retrieval.fused.slice(0, 8)) {
     const src = Object.entries(f.sources)
       .map(([k, v]) => `${k}#${v.rank}(${v.score.toFixed(3)})`)
@@ -88,6 +92,11 @@ export function renderTrace(db: GraphDb, trace: RouteTrace): string {
   L.push(color.bold('\n▸ Stage 2 — seed gate (absolute floor AND contention with top)'));
   for (const s of trace.seeds.slice(0, 10)) {
     L.push(`    ${verdictColor(s.verdict)} ${name(s.id).padEnd(16)} ${color.grey(s.reason)}`);
+    if (s.verdict === 'SEED' && s.confidence !== undefined) {
+      const pct = Math.round(s.confidence * 100);
+      const paint = pct >= 80 ? color.green : pct >= 50 ? color.yellow : color.red;
+      L.push(color.grey(`    ${' '.repeat(16)} confidence `) + paint(`${pct}%`));
+    }
   }
   if (trace.knowledgeGap) {
     L.push(`    ${color.yellow('KNOWLEDGE GAP')} — no module matched well enough; a learn cycle is warranted`);

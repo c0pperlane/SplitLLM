@@ -807,11 +807,18 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
       signal: controller.signal,
     });
 
-    // Hybrid learning: only touch the network when the graph genuinely has a gap.
-    if (result.trace.knowledgeGap) {
+    // Hybrid learning: touch the network when the graph has a gap — with two
+    // guards on top. A query with no extractable entity at all is junk, not a
+    // gap (the "l" incident: 91 seconds and Wikipedia's letter article for a
+    // stray keypress). And at max effort every query learns, because recall
+    // beats latency there — the "always search" mode, opt-in per /effort.
+    const gap = result.trace.knowledgeGap;
+    const hasSubstance = result.trace.entities.length > 0;
+    const wantsLearn = gap ? hasSubstance : session.effort === 'max';
+    if (wantsLearn) {
       const s = result.trace.signals;
       console.log(
-        color.yellow('  knowledge gap') +
+        color.yellow(gap ? '  knowledge gap' : '  max effort — learning anyway') +
           color.grey(
             ` (best match cosine ${s.topCosine.toFixed(3)}, bm25 ${s.topBm25.toFixed(2)}) — searching online…`,
           ),
@@ -824,6 +831,8 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
         extractor: provider.current,
         signal: controller.signal,
       });
+    } else if (gap) {
+      console.log(color.grey('  nothing in the graph, and nothing worth searching for in that — answering directly'));
     }
 
     session.lastTrace = result.trace;
