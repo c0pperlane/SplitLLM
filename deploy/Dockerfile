@@ -19,12 +19,12 @@ LABEL org.opencontainers.image.title="SplitLLM V2" \
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl tar iproute2 tini \
+ && apt-get install -y --no-install-recommends ca-certificates curl tar zstd iproute2 tini \
  && rm -rf /var/lib/apt/lists/*
 
 # Ollama's own installer wants systemd and root-owned service files. The plain
 # tarball is the same binaries without any of that, which is what a container
-# actually needs.
+# actually needs. (v0.32+ ships .tar.zst; older releases used .tgz.)
 ARG OLLAMA_VERSION=v0.32.4
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
@@ -33,8 +33,8 @@ RUN set -eux; \
       arm64) sfx="arm64" ;; \
       *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-${sfx}.tgz" \
-      | tar -xz -C /usr/local; \
+    curl -fsSL "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-${sfx}.tar.zst" \
+      | unzstd | tar -x -C /usr/local; \
     /usr/local/bin/ollama --version || true
 
 # Pterodactyl convention: an unprivileged `container` user with /home/container
