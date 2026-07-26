@@ -15,15 +15,17 @@
  * after install, not a fact to trust blindly.
  */
 
-import { stdout } from 'node:process';
+import { stdin, stdout } from 'node:process';
 import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
-import { runMenu, type MenuItem } from './menu.ts';
+import { ESC, HIDE_CURSOR, KeyReader, SHOW_CURSOR, physicalRows, runMenu, type MenuItem } from './menu.ts';
 import { getCapabilities, listChatModels } from '../providers/capabilities.ts';
 import { SplitLlmProvider, type PullEvent } from '../providers/remote.ts';
 import { providerFor } from '../providers/factory.ts';
+import { hfPullRef, searchHuggingFace, type HfModelResult } from '../providers/hfsearch.ts';
 import { pullServerModel } from '../server/models.ts';
 import { resolveKey, type Endpoint } from '../providers/endpoints.ts';
+import { fmtCount } from './status.ts';
 import type { Ask } from './endpoints-cmd.ts';
 
 export interface ModelBrowserCtx {
@@ -174,6 +176,179 @@ function thinkingBadge(t: boolean | undefined): string {
 }
 
 // ---------------------------------------------------------------------------
+// Type-ahead search over HuggingFace's GGUF catalogue
+// ---------------------------------------------------------------------------
+
+/**
+ * The search bar: type and results follow (debounced, ranked by downloads).
+ * Resolves with the `hf.co/…` pull reference of the chosen repo, or undefined
+ * when the user backs out. Its frame is erased on exit so the caller's menu
+ * redraws as if the panel had never been there.
+ */
+async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined> {
+  if (!stdin.isTTY) return undefined;
+
+  let query = '';
+  let results: HfModelResult[] = [];
+  let pending = false;
+  let failed = '';
+  let cursor = 0;
+  let version = 0;
+  let lastHeight = 0;
+  let picked: string | undefined;
+  let debounce: NodeJS.Timeout | undefined;
+
+  const frame = (): string => {
+    const width = Math.min(stdout.columns ?? 80, 78);
+    const L: string[] = [];
+    L.push('');
+    L.push(color.bold(`  ── SEARCH · huggingface GGUF ${'─'.repeat(Math.max(0, width - 31))}`));
+    L.push(`  ${color.cyan('▸')} ${query}${color.cyan('▌')}`);
+    if (failed) L.push(color.red(`  ${failed}`));
+    else if (pending) L.push(color.grey('  searching…'));
+    else if (!query.trim()) L.push(color.grey('  type to search the whole hub — results ranked by downloads'));
+    else if (results.length === 0) L.push(color.grey('  no GGUF repos match'));
+    L.push('');
+
+    results.forEach((r, i) => {
+      const active = i === cursor;
+      const clipped = r.id.length > 44 ? `${r.id.slice(0, 43)}…` : r.id.padEnd(44);
+      const name = active ? color.bold(clipped) : clipped;
+      const pointer = active ? color.cyan('▶ ') : '  ';
+      const stats = `${(r.sizeHint ?? '?').padEnd(6)}${color.dim(`${fmtCount(r.downloads)}↓ · ${fmtCount(r.likes)}★`)}`;
+      L.push(`  ${pointer}${name}${stats}`);
+      if (active) L.push(color.grey(`      pull: ${hfPullRef(r.id)}`));
+    });
+
+    L.push('');
+    L.push(color.grey('  type to search · ↑/↓ move · Enter pull · Esc back · thinking verified after install'));
+    L.push(color.bold(`  ${'─'.repeat(width - 2)}`));
+    return L.join('\n');
+  };
+
+  const draw = (): void => {
+    if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
+    const f = frame();
+    stdout.write(`${f}\n`);
+    lastHeight = physicalRows(f) + 1;
+  };
+
+  const searchSoon = (): void => {
+    const v = ++version;
+    if (debounce) clearTimeout(debounce);
+    if (!query.trim()) {
+      results = [];
+      pending = false;
+      failed = '';
+      return;
+    }
+    pending = true;
+    failed = '';
+    debounce = setTimeout(() => {
+      void (async () => {
+        try {
+          const r = await searchHuggingFace(query);
+          if (v !== version) return; // a newer keystroke owns the screen
+          results = r;
+          cursor = 0;
+          pending = false;
+        } catch (err) {
+          if (v !== version) return;
+          failed = err instanceof Error ? err.message : String(err);
+          pending = false;
+        }
+        draw();
+      })();
+    }, 250);
+    debounce.unref?.();
+  };
+
+  ctx.rl.pause();
+  const wasRaw = stdin.isRaw ?? false;
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  const reader = new KeyReader(stdin);
+  stdout.write(HIDE_CURSOR);
+
+  try {
+    draw();
+    for (;;) {
+      const key = await reader.next();
+      if (key === ESC || key === '\x03') break;
+      if (key === '\r' || key === '\n') {
+        const r = results[cursor];
+        if (r) picked = hfPullRef(r.id);
+        if (r) break;
+        continue;
+      }
+      if (key === `${ESC}[A`) {
+        cursor = Math.max(0, cursor - 1);
+        draw();
+        continue;
+      }
+      if (key === `${ESC}[B`) {
+        cursor = Math.min(Math.max(0, results.length - 1), cursor + 1);
+        draw();
+        continue;
+      }
+      if (key === '\x7f' || key === '\b') {
+        if (query) {
+          query = query.slice(0, -1);
+          searchSoon();
+        }
+        draw();
+        continue;
+      }
+      if (key.length === 1 && key >= ' ') {
+        query += key;
+        searchSoon();
+        draw();
+        continue;
+      }
+    }
+  } finally {
+    if (debounce) clearTimeout(debounce);
+    reader.dispose();
+    stdout.write(SHOW_CURSOR);
+    try {
+      stdin.setRawMode(wasRaw);
+    } catch {
+      /* terminal may already be gone */
+    }
+    stdin.pause();
+    ctx.rl.resume();
+  }
+
+  // Erase the panel so the caller redraws its own UI cleanly beneath it.
+  if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
+  return picked;
+}
+
+/** Non-interactive form: `/models search <query>` prints the same list once. */
+export async function printModelSearch(query: string): Promise<void> {
+  let results: HfModelResult[];
+  try {
+    results = await searchHuggingFace(query, 15);
+  } catch (err) {
+    console.log(color.red(`  ${err instanceof Error ? err.message : String(err)}`));
+    return;
+  }
+  if (results.length === 0) {
+    console.log(color.grey('  no GGUF repos match'));
+    return;
+  }
+  console.log('');
+  for (const r of results) {
+    console.log(
+      `  ${color.bold(r.id.padEnd(44))} ${color.dim(`${(r.sizeHint ?? '?').padEnd(6)}${fmtCount(r.downloads)}↓ · ${fmtCount(r.likes)}★`)}`,
+    );
+    console.log(color.grey(`  ${' '.repeat(44)} pull: ${hfPullRef(r.id)}`));
+  }
+  console.log(color.grey('\n  thinking capability is verified after install (/api/show), not before.'));
+}
+
+// ---------------------------------------------------------------------------
 // The browser
 // ---------------------------------------------------------------------------
 
@@ -243,8 +418,8 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
   let items = build();
   await runMenu({
     title: `MODELS · ${node}`,
-    subtitle: 'Enter = use it / pull it   p pull by name   r refresh   Esc back',
-    footer: '↑/↓ move   Enter use/pull   p pull by name   r refresh   Esc back',
+    subtitle: 'Enter = use it / pull it   s search huggingface   p pull by name   r refresh   Esc back',
+    footer: '↑/↓ move   Enter use/pull   s search   p pull   r refresh   Esc back',
     items,
     rl: ctx.rl,
     refresh: () => {
@@ -253,8 +428,16 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
       items.push(...next);
     },
     keys: {
+      s: async () => {
+        const picked = await pickFromSearch(ctx);
+        if (picked) {
+          await pullWithProgress(ep, picked);
+          await refetch();
+        }
+        return 'stay' as const;
+      },
       p: async () => {
-        const name = (await ctx.ask('  model tag to pull (e.g. qwen3:8b): ')).trim();
+        const name = (await ctx.ask('  model tag to pull (e.g. qwen3:8b or hf.co/owner/repo): ')).trim();
         if (name) {
           await pullWithProgress(ep, name);
           await refetch();

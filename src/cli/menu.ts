@@ -29,8 +29,9 @@ import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
 
 const ESC = '\x1b';
-const HIDE_CURSOR = `${ESC}[?25l`;
-const SHOW_CURSOR = `${ESC}[?25h`;
+export const HIDE_CURSOR = `${ESC}[?25l`;
+export const SHOW_CURSOR = `${ESC}[?25h`;
+export { ESC };
 
 export interface MenuItem {
   label: string;

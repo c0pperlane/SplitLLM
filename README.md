@@ -226,9 +226,10 @@ it is a bigger local model, not more iterations.
 
 `/models` opens the model browser: installed models with their thinking capability shown per
 row (read live from Ollama's `/api/show`), plus a curated download list with the same flag
-documented up front. Downloads work on whichever node generation uses — the local Ollama, a
-remote `ollama` endpoint, or a `splitllm` backend. `/model <name>` still switches directly,
-prefix-matched as always.
+documented up front. Press `s` and start typing: a search bar queries all of HuggingFace's
+GGUF catalogue (ranked by downloads) and Enter pulls the pick — locally or onto a remote
+node, whichever generation uses. `/models search <query>` prints the same list for scripts.
+`/model <name>` still switches directly, prefix-matched as always.
 
 ## Measured on a Snapdragon X Plus (X1P64100, 10 cores, 15.6 GB)
 

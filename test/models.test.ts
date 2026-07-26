@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MODEL_CATALOG, fmtGb } from '../src/cli/models.ts';
+import { hfPullRef, sizeFromName } from '../src/providers/hfsearch.ts';
 
 test('catalog entries are complete and consistently shaped', () => {
   assert.ok(MODEL_CATALOG.length >= 5);
@@ -28,4 +29,14 @@ test('the shipped defaults are thinking-capable', () => {
 test('fmtGb formats and tolerates undefined', () => {
   assert.equal(fmtGb(2_600_000_000), '2.6');
   assert.equal(fmtGb(undefined), '?');
+});
+
+test('sizeFromName reads param hints out of repo names', () => {
+  assert.equal(sizeFromName('unsloth/Qwen3.5-4B-GGUF'), '4B');
+  assert.equal(sizeFromName('HauhauCS/Qwen3.6-35B-A3B-Uncensored'), '35B');
+  assert.equal(sizeFromName('owner/no-size-here'), undefined);
+});
+
+test('hfPullRef builds the reference ollama understands', () => {
+  assert.equal(hfPullRef('unsloth/Qwen3.5-4B-GGUF'), 'hf.co/unsloth/Qwen3.5-4B-GGUF');
 });

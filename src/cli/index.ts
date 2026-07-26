@@ -38,7 +38,7 @@ import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
 import { UsageLedger, renderUsage } from './usage.ts';
-import { runModelBrowser } from './models.ts';
+import { runModelBrowser, printModelSearch } from './models.ts';
 import { runSettingsMenu, runEndpointsMenu, settingsShortcut, type SettingsCtx } from './settings-menu.ts';
 import type { Provider } from '../providers/types.ts';
 import { EndpointRegistry, KIND_DEFAULTS } from '../providers/endpoints.ts';
@@ -531,6 +531,13 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
         }
         return false;
       }
+      const [sub, ...restWords] = arg.split(/\s+/);
+      if (sub === 'search') {
+        const q = restWords.join(' ').trim();
+        if (!q) console.log(color.grey('  usage: /models search <query> — the interactive version is /models, key s'));
+        else await printModelSearch(q);
+        return false;
+      }
       await switchToModel(ctx, arg);
       return false;
     }
@@ -848,6 +855,7 @@ function printHelp(): void {
   console.log(`
 ${color.bold('  commands')}
     /models [name]              model browser: switch, thinking support, downloads
+    /models search <query>      search huggingface GGUF repos (s inside /models)
     /effort <low..max>          router breadth: seeds, hops, modules, pages
     /think <on|off|show>        toggle reasoning; 'show' displays it
     /design <brief>             generate a page, verify it, repair until it converges
