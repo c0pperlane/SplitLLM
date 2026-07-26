@@ -175,3 +175,14 @@ CREATE TABLE IF NOT EXISTS search_cache (
   fetched_at   TEXT    NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (q, provider)
 );
+
+-- ---------------------------------------------------------------------------
+-- Word-judge cache. Parts of speech as reported by the dictionary API, so a
+-- word is looked up once ever. Empty pos = "the dictionary did not know it",
+-- which is itself worth remembering (non-English words land there).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS word_pos (
+  token       TEXT    PRIMARY KEY,
+  pos         TEXT    NOT NULL DEFAULT '',
+  fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);

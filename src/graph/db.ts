@@ -308,6 +308,25 @@ export class GraphDb {
     return out;
   }
 
+  /** Cached page bodies, for corpus statistics (the word judge). */
+  cachedPages(): Array<{ url: string; domain: string; body: string }> {
+    return this.db
+      .prepare('SELECT url, domain, body FROM page_cache')
+      .all() as Array<{ url: string; domain: string; body: string }>;
+  }
+
+  /** Dictionary POS cache for the word judge. Undefined = never asked. */
+  getWordPos(token: string): string | undefined {
+    const r = this.db.prepare('SELECT pos FROM word_pos WHERE token = ?').get(token) as { pos: string } | undefined;
+    return r?.pos;
+  }
+
+  setWordPos(token: string, pos: string): void {
+    this.db
+      .prepare("INSERT INTO word_pos (token, pos, fetched_at) VALUES (?, ?, datetime('now')) ON CONFLICT(token) DO UPDATE SET pos = excluded.pos, fetched_at = excluded.fetched_at")
+      .run(token, pos);
+  }
+
   // -------------------------------------------------------------------------
   // Edges
   // -------------------------------------------------------------------------

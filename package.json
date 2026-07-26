@@ -16,6 +16,7 @@
     "start": "node dist/cli/index.js",
     "serve": "node --experimental-strip-types src/server/index.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
+    "audit": "node --experimental-strip-types scripts/route-audit.ts",
     "seed": "node --experimental-strip-types scripts/seed.ts",
     "bench": "node --experimental-strip-types scripts/bench.ts"
   },

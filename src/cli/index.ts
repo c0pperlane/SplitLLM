@@ -22,6 +22,7 @@ import {
   type ModelCapabilities,
 } from '../providers/capabilities.ts';
 import { learn } from '../learn/orchestrator.ts';
+import { anySubject, dictionaryPosFetcher } from '../learn/wordclass.ts';
 import { color, renderGraph, renderTrace, renderWhy } from './debug.ts';
 import type { RouteTrace } from '../router/pipeline.ts';
 import { describeSettings, showPerformancePanel } from './performance.ts';
@@ -568,6 +569,7 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
           `    seeds<=${th.maxSeeds} hops<=${th.maxHops} modules<=${th.maxModules} pages<=${th.maxPagesPerLearn}`,
         ),
       );
+      if (session.effort === 'max') console.log(color.grey('    max learns on EVERY query — expect 30-90s each'));
       return false;
     }
 
@@ -813,7 +815,15 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
     // stray keypress). And at max effort every query learns, because recall
     // beats latency there — the "always search" mode, opt-in per /effort.
     const gap = result.trace.knowledgeGap;
-    const hasSubstance = result.trace.entities.length > 0;
+    let hasSubstance = result.trace.entities.length > 0;
+    if (hasSubstance && gap) {
+      // The word judge: measured evidence (corpus distribution, titles, a
+      // cached dictionary) that the query names a subject worth 90 seconds of
+      // web search. Basic words do not buy a learn cycle. It only ever blocks;
+      // it never adds one, and it needs no word lists.
+      const judged = await anySubject(ctx.db, result.trace.entities, dictionaryPosFetcher(ctx.db));
+      hasSubstance = judged.yes;
+    }
     const wantsLearn = gap ? hasSubstance : session.effort === 'max';
     if (wantsLearn) {
       const s = result.trace.signals;
