@@ -37,6 +37,8 @@ export interface ModelBrowserCtx {
   currentModel: () => string;
   /** Switch generation on this node to a model. Throws on failure. */
   switchTo: (model: string) => Promise<void>;
+  /** Register what Ctrl+C aborts right now — long downloads install an abort. */
+  setInterrupt?: (fn: (() => void) | undefined) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -126,18 +128,23 @@ async function installedRows(ep: Endpoint | undefined, currentModel: string): Pr
 // Downloading onto a node
 // ---------------------------------------------------------------------------
 
-async function pullOnNode(ep: Endpoint | undefined, model: string, onProgress: (p: PullEvent) => void): Promise<void> {
+async function pullOnNode(
+  ep: Endpoint | undefined,
+  model: string,
+  onProgress: (p: PullEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
   if (!ep || ep.kind === 'ollama') {
     const host = ep?.baseUrl ?? process.env.OLLAMA_HOST ?? 'http://localhost:11434';
     const key = ep ? resolveKey(ep) : undefined;
-    await pullServerModel(host, model, onProgress, undefined, {
+    await pullServerModel(host, model, onProgress, signal, {
       ...(key ? { Authorization: `Bearer ${key}` } : {}),
       ...(ep?.headers ?? {}),
     });
     return;
   }
   if (ep.kind === 'splitllm') {
-    await new SplitLlmProvider(ep).pullModel(model, onProgress);
+    await new SplitLlmProvider(ep).pullModel(model, onProgress, signal);
     return;
   }
   throw new Error(`${ep.kind} endpoints are hosted APIs — there is nothing to download onto them`);
@@ -160,14 +167,20 @@ function progressPrinter(): (p: PullEvent) => void {
   };
 }
 
-async function pullWithProgress(ep: Endpoint | undefined, model: string): Promise<void> {
+async function pullWithProgress(ctx: ModelBrowserCtx, model: string): Promise<void> {
+  // A multi-GB download is the longest wait this UI has; ^C must end it.
+  const controller = new AbortController();
+  ctx.setInterrupt?.(() => controller.abort());
   try {
-    await pullOnNode(ep, model, progressPrinter());
+    await pullOnNode(ctx.activeEndpoint, model, progressPrinter(), controller.signal);
     stdout.write('\n');
     console.log(color.green(`  installed ${model}`));
   } catch (err) {
     stdout.write('\n');
-    console.log(color.red(`  pull failed: ${err instanceof Error ? err.message : String(err)}`));
+    if (controller.signal.aborted) console.log(color.yellow('  pull cancelled'));
+    else console.log(color.red(`  pull failed: ${err instanceof Error ? err.message : String(err)}`));
+  } finally {
+    ctx.setInterrupt?.(undefined);
   }
 }
 
@@ -406,7 +419,7 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
         value: () => `~${c.sizeGb.toFixed(1)} GB · ${c.thinking ? color.green('thinking') : color.grey('no thinking')}`,
         hint: `${c.params} · ${c.note}`,
         run: async () => {
-          await pullWithProgress(ep, c.name);
+          await pullWithProgress(ctx, c.name);
           await refetch();
           return 'stay' as const;
         },
@@ -431,7 +444,7 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
       s: async () => {
         const picked = await pickFromSearch(ctx);
         if (picked) {
-          await pullWithProgress(ep, picked);
+          await pullWithProgress(ctx, picked);
           await refetch();
         }
         return 'stay' as const;
@@ -439,7 +452,7 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
       p: async () => {
         const name = (await ctx.ask('  model tag to pull (e.g. qwen3:8b or hf.co/owner/repo): ')).trim();
         if (name) {
-          await pullWithProgress(ep, name);
+          await pullWithProgress(ctx, name);
           await refetch();
         }
         return 'stay' as const;

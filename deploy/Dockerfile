@@ -25,7 +25,7 @@ RUN apt-get update \
 # Ollama's own installer wants systemd and root-owned service files. The plain
 # tarball is the same binaries without any of that, which is what a container
 # actually needs.
-ARG OLLAMA_VERSION=v0.12.11
+ARG OLLAMA_VERSION=v0.32.4
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
     case "$arch" in \

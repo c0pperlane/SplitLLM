@@ -113,6 +113,11 @@ interface Ctx {
   embedder: OllamaEmbeddings;
   endpoints: EndpointRegistry;
   bar: StatusBar;
+  /**
+   * What Ctrl+C should do right now. A running request installs an abort here;
+   * at the prompt there is none and ^C leaves the REPL instead.
+   */
+  interrupt: { current: (() => void) | undefined };
 }
 
 /**
@@ -204,9 +209,21 @@ async function main(): Promise<void> {
   const rl = createInterface({ input: stdin, output: stdout, historySize: 200 });
   const lines = new LineReader(rl);
   const bar = new StatusBar();
-  const ctx: Ctx = { rl, lines, db, session, provider, embedder, endpoints, bar };
+  const ctx: Ctx = {
+    rl, lines, db, session, provider, embedder, endpoints, bar,
+    interrupt: { current: undefined },
+  };
   bar.attach();
   syncBar(ctx);
+
+  // One ^C, two meanings: during a request it aborts the request; at the
+  // prompt it leaves through the normal cleanup path. In readline's raw
+  // terminal mode ^C is just a byte — nothing else interprets it, so this
+  // listener is the whole meaning of the key.
+  rl.on('SIGINT', () => {
+    if (ctx.interrupt.current) ctx.interrupt.current();
+    else lines.cancel();
+  });
 
   for (;;) {
     let line: string;
@@ -524,6 +541,9 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
             activeEndpoint: activeEp && activeEp.enabled !== false ? activeEp : undefined,
             currentModel: () => provider.current.model,
             switchTo: (m) => switchToModel(ctx, m),
+            setInterrupt: (fn) => {
+              ctx.interrupt.current = fn;
+            },
           });
         } finally {
           ctx.bar.resume();
@@ -711,12 +731,13 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
   }
 }
 
-async function runLearn(ctx: Ctx, topic: string): Promise<void> {
+async function runLearn(ctx: Ctx, topic: string, signal?: AbortSignal): Promise<void> {
   console.log(color.dim(`  learning "${topic}" …`));
   const res = await learn(ctx.db, topic, {
     thresholds: activeThresholds(),
     effort: ctx.session.effort,
     conceptExtractor: ctx.provider.current,
+    signal,
     onProgress: (msg) => console.log(color.grey(`    ${msg}`)),
   });
 
@@ -737,118 +758,150 @@ async function runLearn(ctx: Ctx, topic: string): Promise<void> {
 async function handleQuery(query: string, ctx: Ctx): Promise<void> {
   const { db, session, provider, embedder } = ctx;
 
-  const resolved = resolveRequest(session.caps, {
-    effort: session.effort,
-    thinking: session.thinking,
-  });
-  for (const a of resolved.adjustments) console.log(color.yellow(`  ! ${a}`));
+  // Ctrl+C country. One controller covers routing, learning and generation —
+  // they are all "the request" from the user's chair. ^C aborts it; the REPL
+  // and the prompt survive. A second ^C then exits, since interrupt is cleared.
+  const controller = new AbortController();
+  ctx.interrupt.current = () => {
+    controller.abort();
+    ctx.bar.set({ busy: false, tps: 0 });
+  };
+  // The kill -INT path (no TTY): readline never sees it, so listen here too.
+  const onProcSigint = (): void => controller.abort();
+  process.once('SIGINT', onProcSigint);
 
-  const t0 = Date.now();
-  let result = await route(db, query, {
-    effort: resolved.effort,
-    baseThresholds: activeThresholds(),
-    embedder,
-    extractor: provider.current,
-  });
+  try {
+    const resolved = resolveRequest(session.caps, {
+      effort: session.effort,
+      thinking: session.thinking,
+    });
+    for (const a of resolved.adjustments) console.log(color.yellow(`  ! ${a}`));
 
-  // Hybrid learning: only touch the network when the graph genuinely has a gap.
-  if (result.trace.knowledgeGap) {
-    const s = result.trace.signals;
-    console.log(
-      color.yellow('  knowledge gap') +
-        color.grey(
-          ` (best match cosine ${s.topCosine.toFixed(3)}, bm25 ${s.topBm25.toFixed(2)}) — searching online…`,
-        ),
-    );
-    await runLearn(ctx, query);
-    result = await route(db, query, {
+    const t0 = Date.now();
+    let result = await route(db, query, {
       effort: resolved.effort,
       baseThresholds: activeThresholds(),
       embedder,
       extractor: provider.current,
+      signal: controller.signal,
     });
-  }
 
-  session.lastTrace = result.trace;
-  const names = result.modules.map((m) => m.name);
-  console.log(
-    color.dim(`  routed in ${Date.now() - t0}ms → `) +
-      (names.length ? names.join(', ') : color.yellow('no relevant modules — answering without context')) +
-      color.grey('   (/debug for the numbers)'),
-  );
+    // Hybrid learning: only touch the network when the graph genuinely has a gap.
+    if (result.trace.knowledgeGap) {
+      const s = result.trace.signals;
+      console.log(
+        color.yellow('  knowledge gap') +
+          color.grey(
+            ` (best match cosine ${s.topCosine.toFixed(3)}, bm25 ${s.topBm25.toFixed(2)}) — searching online…`,
+          ),
+      );
+      await runLearn(ctx, query, controller.signal);
+      result = await route(db, query, {
+        effort: resolved.effort,
+        baseThresholds: activeThresholds(),
+        embedder,
+        extractor: provider.current,
+        signal: controller.signal,
+      });
+    }
 
-  const avail = await provider.current.available();
-  if (!avail.ok) {
-    console.log(color.red(`  model unavailable: ${avail.reason}`));
-    return;
-  }
+    session.lastTrace = result.trace;
+    const names = result.modules.map((m) => m.name);
+    console.log(
+      color.dim(`  routed in ${Date.now() - t0}ms → `) +
+        (names.length ? names.join(', ') : color.yellow('no relevant modules — answering without context')) +
+        color.grey('   (/debug for the numbers)'),
+    );
 
-  // Ollama keeps answering /api/tags after its runner wedges (which happens
-  // when the machine sleeps), so `available()` alone is not enough — without
-  // this the REPL would simply appear to freeze on the next question.
-  const local = asOllama(provider.current);
-  if (session.turns === 0 && local) {
-    const health = await local.healthy();
-    if (!health.ok) {
-      console.log(color.red('  local model is not generating:'));
-      console.log(color.grey(`  ${health.reason}`));
+    const avail = await provider.current.available();
+    if (!avail.ok) {
+      console.log(color.red(`  model unavailable: ${avail.reason}`));
       return;
     }
-  }
 
-  const system = result.context
-    ? `${ANSWER_SYSTEM}\n\n# CONTEXT\n${result.context}`
-    : NO_CONTEXT_SYSTEM;
-
-  stdout.write('\n');
-  let thinkingShown = false;
-  // Live throughput in the bar. Counted from streamed chunks rather than from
-  // the final usage figure, because the point is to see movement while it is
-  // still generating — a silent terminal for 40 seconds is indistinguishable
-  // from a wedged runner.
-  const genStart = Date.now();
-  let streamed = 0;
-  ctx.bar.set({ busy: true, tps: 0 });
-  const gen = await provider.current.generate({
-    system,
-    messages: [{ role: 'user', content: query }],
-    effort: resolved.effort,
-    thinking: resolved.thinking,
-    maxTokens: getSettings().maxTokens,
-    onToken: (t) => {
-      stdout.write(t);
-      streamed += 1;
-      const secs = (Date.now() - genStart) / 1000;
-      if (secs > 0.5) ctx.bar.set({ tps: streamed / secs, busy: true });
-    },
-    onThinking: (t) => {
-      if (!session.showThinking) return;
-      if (!thinkingShown) {
-        stdout.write(color.grey('\n[thinking] '));
-        thinkingShown = true;
+    // Ollama keeps answering /api/tags after its runner wedges (which happens
+    // when the machine sleeps), so `available()` alone is not enough — without
+    // this the REPL would simply appear to freeze on the next question.
+    const local = asOllama(provider.current);
+    if (session.turns === 0 && local) {
+      const health = await local.healthy();
+      if (!health.ok) {
+        console.log(color.red('  local model is not generating:'));
+        console.log(color.grey(`  ${health.reason}`));
+        return;
       }
-      stdout.write(color.grey(t));
-    },
-  });
-  stdout.write('\n');
+    }
 
-  session.turns += 1;
-  session.tokensIn += gen.usage.inputTokens;
-  session.tokensOut += gen.usage.outputTokens;
+    const system = result.context
+      ? `${ANSWER_SYSTEM}\n\n# CONTEXT\n${result.context}`
+      : NO_CONTEXT_SYSTEM;
 
-  const elapsed = Date.now() - genStart;
-  const rate = gen.tokensPerSecond ?? (elapsed > 0 ? streamed / (elapsed / 1000) : 0);
-  session.usage.record(nodeKey(ctx), gen.usage, elapsed, rate);
-  session.meter.record(gen.usage, elapsed, rate);
+    stdout.write('\n');
+    let thinkingShown = false;
+    // Live throughput in the bar. Counted from streamed chunks rather than from
+    // the final usage figure, because the point is to see movement while it is
+    // still generating — a silent terminal for 40 seconds is indistinguishable
+    // from a wedged runner.
+    const genStart = Date.now();
+    let streamed = 0;
+    ctx.bar.set({ busy: true, tps: 0 });
+    const gen = await provider.current.generate({
+      system,
+      messages: [{ role: 'user', content: query }],
+      effort: resolved.effort,
+      thinking: resolved.thinking,
+      maxTokens: getSettings().maxTokens,
+      signal: controller.signal,
+      onToken: (t) => {
+        stdout.write(t);
+        streamed += 1;
+        const secs = (Date.now() - genStart) / 1000;
+        if (secs > 0.5) ctx.bar.set({ tps: streamed / secs, busy: true });
+      },
+      onThinking: (t) => {
+        if (!session.showThinking) return;
+        if (!thinkingShown) {
+          stdout.write(color.grey('\n[thinking] '));
+          thinkingShown = true;
+        }
+        stdout.write(color.grey(t));
+      },
+    });
+    stdout.write('\n');
 
-  // Context is what the model saw this turn plus what it produced. The system
-  // prompt carries the routed CONTEXT block, so it is the bulk of it and cannot
-  // be left out of the estimate.
-  session.contextUsed = estimateTokens(system + query) + gen.usage.outputTokens;
-  syncBar(ctx, { busy: false, tps: rate });
+    session.turns += 1;
+    session.tokensIn += gen.usage.inputTokens;
+    session.tokensOut += gen.usage.outputTokens;
 
-  const tps = rate > 0 ? ` @ ${rate.toFixed(1)} tok/s` : '';
-  console.log(color.dim(`\n  ${gen.usage.inputTokens} in / ${gen.usage.outputTokens} out${tps}`));
+    const elapsed = Date.now() - genStart;
+    const rate = gen.tokensPerSecond ?? (elapsed > 0 ? streamed / (elapsed / 1000) : 0);
+    session.usage.record(nodeKey(ctx), gen.usage, elapsed, rate);
+    session.meter.record(gen.usage, elapsed, rate);
+
+    // Context is what the model saw this turn plus what it produced. The system
+    // prompt carries the routed CONTEXT block, so it is the bulk of it and cannot
+    // be left out of the estimate.
+    session.contextUsed = estimateTokens(system + query) + gen.usage.outputTokens;
+    syncBar(ctx, { busy: false, tps: rate });
+
+    const tps = rate > 0 ? ` @ ${rate.toFixed(1)} tok/s` : '';
+    console.log(color.dim(`\n  ${gen.usage.inputTokens} in / ${gen.usage.outputTokens} out${tps}`));
+  } catch (err) {
+    if (controller.signal.aborted) {
+      stdout.write('\n');
+      console.log(color.yellow('  cancelled'));
+      ctx.bar.set({ busy: false, tps: 0 });
+    } else {
+      // A failed request (endpoint down, 429, timeout) is a message, not a
+      // reason to take the whole REPL down with it.
+      stdout.write('\n');
+      console.log(color.red(`  request failed: ${err instanceof Error ? err.message : String(err)}`));
+      ctx.bar.set({ busy: false, tps: 0 });
+    }
+  } finally {
+    ctx.interrupt.current = undefined;
+    process.removeListener('SIGINT', onProcSigint);
+  }
 }
 
 function printHelp(): void {

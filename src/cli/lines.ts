@@ -61,6 +61,18 @@ export class LineReader {
     });
   }
 
+  /**
+   * Resolve a pending prompt with "end of input", as if Ctrl-D arrived.
+   * Ctrl+C at the prompt uses this to leave through the normal cleanup path
+   * (status bar detached, db closed) instead of dying mid-frame.
+   */
+  cancel(): void {
+    if (!this.waiting) return;
+    const w = this.waiting;
+    this.waiting = undefined;
+    w.resolve(undefined);
+  }
+
   /** True when input is waiting — used to skip cosmetic redraws. */
   get pending(): number {
     return this.queue.length;

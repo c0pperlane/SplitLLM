@@ -392,13 +392,13 @@ export class SplitLlmProvider implements Provider {
   }
 
   /** Download a model onto the backend, with progress mirrored from its NDJSON stream. */
-  async pullModel(model: string, onProgress?: (p: PullEvent) => void): Promise<void> {
+  async pullModel(model: string, onProgress?: (p: PullEvent) => void, signal?: AbortSignal): Promise<void> {
     const res = await fetch(`${this.ep.baseUrl}/v1/models/pull`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify({ model }),
       // A multi-GB pull over a slow link takes tens of minutes.
-      signal: AbortSignal.timeout(3_600_000),
+      signal: withTimeout(signal, 3_600_000),
     });
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} ${await errorBody(res)}`);
     for await (const ev of readNdjson<{ type?: string; status?: string; percent?: number; completedBytes?: number; totalBytes?: number; error?: string }>(res.body)) {
