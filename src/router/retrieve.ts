@@ -244,7 +244,11 @@ export async function retrieveCandidates(
         medianCosine = all[Math.floor(all.length / 2)]!.score;
       }
 
-      vectorList = all.slice(0, opts.topK);
+      // Grounded too. `unclaimed` only ever holds modules matched through their
+      // NAME, so this cannot touch a description match — which is what German
+      // and paraphrase routing rely on. It does stop `whole-grain` riding the
+      // embedding of "the whole table" into a postgres answer.
+      vectorList = ground(all.slice(0, opts.topK));
       embeddingUsed = true;
     } catch (err) {
       // Semantic retrieval is an enhancement. If the embedder is down, lexical
