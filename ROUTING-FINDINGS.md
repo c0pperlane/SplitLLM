@@ -96,3 +96,70 @@ the learn loop never sets `seeded = 1`, because if it does, every structural
 brake in the design is bypassed. Minecraft's own junk edges are `seeded = 0`
 with `n_obs = 1`, so they *are* being filtered — the `sourdough-bread, go`
 contamination on that query has not been root-caused.
+
+---
+
+# Scale test: 57 → 150 modules (2026-07-27)
+
+Learned 38 deliberately unrelated topics (`wireguard nat traversal`,
+`beekeeping varroa mite`, `violin bow rehairing`, `vulkan descriptor sets`, …)
+against a fixed 16-query battery.
+
+```
+BEFORE   57 modules ·  831 edges   ->  16/16
+AFTER   150 modules · 2907 edges   ->  14/16
+```
+
+**The structural brakes held.** Only **421/2907 edges (14.5%)** can propagate;
+`n_obs >= 3 AND n_domains >= 2` blocks 85% of what the learn loop produced. The
+graph tripled without everything linking to everything, which is the design's
+central claim.
+
+**Accuracy did not fully hold.** Both new failures trace to one cause:
+
+```
+redis connection refused after reboot  ->  connection      (not redis)
+what is the capital of france          ->  ssl, html, css, web-hosting
+```
+
+`connection` is a module. So are `modules`, `load`, `site`, `tool`, `make`,
+`std`. The learn loop mints ordinary English words from prose co-occurrence
+(confidence 0.25), and once they exist they match everything. Every subsequent
+cycle mints more.
+
+## Two mint-time fixes attempted, both wrong, both reverted
+
+**1. Gate on `judgeWord`'s verdict.** Rejects nothing — measured, it calls
+`connection`, `modules`, `load`, `site` and `tool` all `subject` at confidence
+1.00. Correct for its actual job (deciding whether a query is worth a web
+search, where any noun qualifies) and useless as a mint gate.
+
+**2. Gate on `dictionary-knows-it AND never-heads-a-section`.** Rejects
+`pterodactyl` — a dictionary word (the dinosaur) that happens not to head any
+cached page — while keeping `connection`, `modules`, `load` and `tool`, all of
+which *do* appear in headings ("Connection refused"). Would have broken the
+core use case.
+
+Measured verdicts:
+
+| term | in dictionary | heads a section | rule 2 says |
+|---|---|---|---|
+| connection | yes | yes | keep ✗ |
+| site | yes | no | reject ✓ |
+| pterodactyl | yes | no | **reject ✗✗** |
+| redis | no | yes | keep ✓ |
+| flour | yes | yes | keep ✓ |
+
+## What a real fix needs
+
+Neither dictionary presence nor heading-occurrence separates "ordinary word that
+happens to be near technical text" from "ordinary word that is genuinely this
+domain's term of art" (`flour`, `starter`, `dough`, `spring`). The signal that
+would work is probably **distribution across domains**: a term appearing in
+pages from many unrelated topics is glue; one concentrated in a few related
+domains is a subject. `edge_evidence` already stores per-domain provenance, so
+the data exists — it is not yet used this way.
+
+Until then the mitigation is at ROUTE time, not mint time: name-match grounding
+(shipped) stops these words winning unless the query actually claims them. That
+is why the battery holds at 14/16 rather than collapsing.
