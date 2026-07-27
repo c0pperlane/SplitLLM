@@ -457,3 +457,58 @@ test('hostile context cannot smuggle itself out of the fence', async () => {
   // point is that it does not become a second set of instructions.
   assert.ok(got.startsWith('docs'), `unexpected extraction: ${got.slice(0, 40)}`);
 });
+
+// ---------------------------------------------------------------------------
+// Mint gate: domain breadth separates a domain's term of art from glue.
+// Measured over 248 cached pages on 159 hostnames. Two earlier gates failed
+// here — judgeWord's verdict rejected nothing, and dictionary+heading rejected
+// `pterodactyl` — so these numbers are pinned.
+// ---------------------------------------------------------------------------
+
+test('domain breadth separates glue from real terms', async () => {
+  const { GraphDb, defaultDbPath } = await import('../src/graph/db.ts');
+  const fs = await import('node:fs');
+  if (!fs.existsSync(defaultDbPath())) return; // no corpus in CI
+
+  const db = new GraphDb(defaultDbPath());
+  try {
+    if (db.cachedPages().length < 50) return; // too small to be meaningful
+
+    const glue = ['connection', 'modules', 'load', 'site', 'tool', 'support', 'version', 'required'];
+    const real = ['redis', 'nginx', 'postgresql', 'wireguard', 'flour', 'sourdough', 'crumb', 'kubernetes'];
+    const b = db.termDomainBreadth([...glue, ...real]);
+
+    const worstReal = Math.max(...real.map((t) => b.get(t) ?? 0));
+    const bestGlue = Math.min(...glue.map((t) => b.get(t) ?? 0));
+
+    // The whole gate rests on these not overlapping.
+    assert.ok(
+      worstReal < bestGlue,
+      `no separation: worst real ${(worstReal * 100).toFixed(0)}% >= best glue ${(bestGlue * 100).toFixed(0)}%`,
+    );
+    // And on 10% sitting between them.
+    assert.ok(worstReal <= 0.10, `a real term reached ${(worstReal * 100).toFixed(0)}% breadth`);
+    assert.ok(bestGlue > 0.10, `a glue term sat at only ${(bestGlue * 100).toFixed(0)}% breadth`);
+  } finally {
+    db.close();
+  }
+});
+
+test('ordinary English words confined to one domain are kept', async () => {
+  const { GraphDb, defaultDbPath } = await import('../src/graph/db.ts');
+  const fs = await import('node:fs');
+  if (!fs.existsSync(defaultDbPath())) return;
+  const db = new GraphDb(defaultDbPath());
+  try {
+    if (db.cachedPages().length < 50) return;
+    // The case that killed the dictionary-based gate: `flour` and `crumb` are
+    // ordinary words AND legitimate modules. Breadth keeps them; a dictionary
+    // check would not.
+    const b = db.termDomainBreadth(['flour', 'crumb', 'connection']);
+    assert.ok((b.get('flour') ?? 1) <= 0.10, 'flour must survive');
+    assert.ok((b.get('crumb') ?? 1) <= 0.10, 'crumb must survive');
+    assert.ok((b.get('connection') ?? 0) > 0.10, 'connection must not');
+  } finally {
+    db.close();
+  }
+});

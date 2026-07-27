@@ -9,7 +9,7 @@
 
 import type { GraphDb } from '../graph/db.ts';
 import { ingestPage, recomputeAllEdges } from '../graph/edges.ts';
-import { extractPage, buildLexicon } from './parse.ts';
+import { extractPage, buildLexicon, type PageExtraction } from './parse.ts';
 import { fetchPage } from './fetch.ts';
 import { searchAll } from './search/index.ts';
 import type { EngineHealth } from './search/types.ts';
@@ -169,7 +169,8 @@ export async function learn(
       continue;
     }
 
-    const ing = ingestPage(db, url, extraction, th);
+    const rejected = rejectGlueTerms(db, extraction, opts);
+    const ing = ingestPage(db, url, extraction, th, rejected);
     result.modulesTouched += ing.modulesTouched;
     result.edgesCreated += ing.edgesCreated;
     result.edgesPruned += ing.edgesPruned;
@@ -188,4 +189,64 @@ export async function learn(
   if (result.pagesFetched > 0) recomputeAllEdges(db);
 
   return result;
+}
+
+/** Above this confidence the term came from a command or package list, not prose. */
+const PROSE_ONLY_CEILING = 0.6;
+
+/**
+ * A term appearing on more than this share of the corpus's hostnames is glue.
+ *
+ * CALIBRATED, not derived — measured over 248 pages on 159 hostnames. The
+ * boundary is genuinely narrow: `kubernetes` sits at 9% and `connection` at
+ * 11%, so 10% splits them with about one hostname of margin either side. All
+ * the measured terms are in the test suite, so corpus growth shifting the
+ * distribution fails loudly instead of quietly minting glue again.
+ */
+const MAX_DOMAIN_BREADTH = 0.10;
+
+/**
+ * Terms that must not become modules.
+ *
+ * MEASURED. After learning 38 unrelated topics the registry went 57 -> 150
+ * modules and a fixed battery fell 16/16 -> 14/16. Every new failure traced to
+ * ordinary English words minted from prose:
+ *
+ *   "redis connection refused after reboot"  ->  connection   (not redis)
+ *   "what is the capital of france"          ->  ssl, html, css, web-hosting
+ *
+ * Two earlier gates failed and are worth not repeating. Gating on `judgeWord`'s
+ * verdict rejects nothing — it calls every noun a subject, which is right for
+ * deciding whether to search the web and useless here. Gating on "the
+ * dictionary knows it and it never heads a section" rejects `pterodactyl`, a
+ * dictionary word that happens not to head a cached page.
+ *
+ * Domain breadth works where both failed, because it measures the thing that
+ * actually distinguishes them: `flour` is an ordinary word confined to baking
+ * sites, `connection` is an ordinary word that appears everywhere.
+ *
+ * Install-command evidence is exempt. Someone typing `apt install make` settles
+ * the question no matter how common the word is — and that exemption is what
+ * keeps `make`, `curl` and `go` as modules while rejecting them as prose noise.
+ */
+function rejectGlueTerms(
+  db: GraphDb,
+  extraction: PageExtraction,
+  opts: LearnOptions,
+): Set<string> {
+  const rejected = new Set<string>();
+  const proseOnly = [...extraction.terms.entries()]
+    .filter(([t, meta]) => meta.confidence < PROSE_ONLY_CEILING && !t.includes('-') && !t.includes('.'))
+    .map(([t]) => t);
+  if (proseOnly.length === 0) return rejected;
+
+  const breadth = db.termDomainBreadth(proseOnly);
+  for (const term of proseOnly) {
+    const share = breadth.get(term) ?? 0;
+    if (share > MAX_DOMAIN_BREADTH) {
+      rejected.add(term);
+      opts.onProgress?.(`  skipped '${term}' — on ${(share * 100).toFixed(0)}% of known hostnames, that is glue not a subject`);
+    }
+  }
+  return rejected;
 }

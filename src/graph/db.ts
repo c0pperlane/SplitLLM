@@ -344,6 +344,74 @@ export class GraphDb {
     return out;
   }
 
+  /**
+   * How widely a term is spread across the hostnames the corpus has seen.
+   *
+   * The measurement that separates a domain's term of art from connective
+   * tissue, and the one the two earlier attempts at this lacked. Measured over
+   * 248 cached pages on 159 hostnames:
+   *
+   *   support 39%   make 30%   site 31%   version 25%   tool 25%
+   *   required 21%  load 14%   modules 11%   connection 11%
+   *   ---------------------------------------------------------
+   *   kubernetes 9%   postgresql 6%   redis 5%   nginx 4%   flour 4%
+   *   sourdough 4%    wireguard 3%    crumb 3%   pterodactyl 0%
+   *
+   * `flour` and `crumb` are ordinary English words and sit with the technical
+   * terms, because they only appear on baking sites. `connection` is also an
+   * ordinary English word and sits with the glue, because it appears
+   * everywhere. That is the distinction neither a dictionary nor a heading
+   * count could make.
+   *
+   * Returns a fraction of distinct hostnames, so it does not drift as the
+   * corpus grows — 5 hostnames out of 10 means the same thing as 50 out of 100.
+   */
+  termDomainBreadth(terms: readonly string[]): Map<string, number> {
+    const index = this.tokenDomainIndex();
+    const out = new Map<string, number>();
+    const total = Math.max(1, index.domains);
+    for (const t of terms) {
+      out.set(t, (index.byToken.get(t.toLowerCase())?.size ?? 0) / total);
+    }
+    return out;
+  }
+
+  /**
+   * token -> set of hostnames containing it, built once and reused.
+   *
+   * Built in a single pass because the alternative — scanning every cached body
+   * per term — is 780 KB x 248 pages per lookup, which turns a learn cycle into
+   * a minutes-long stall.
+   */
+  private tokenIndexCache?: { byToken: Map<string, Set<string>>; domains: number; pages: number };
+
+  private tokenDomainIndex(): { byToken: Map<string, Set<string>>; domains: number } {
+    const pages = this.cachedPages();
+    if (this.tokenIndexCache && this.tokenIndexCache.pages === pages.length) {
+      return this.tokenIndexCache;
+    }
+    const byToken = new Map<string, Set<string>>();
+    const domains = new Set<string>();
+    for (const p of pages) {
+      domains.add(p.domain);
+      const text = p.body
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .toLowerCase();
+      // A Set per page, so one page mentioning a word fifty times still counts
+      // its hostname once. Breadth, not frequency, is the signal.
+      for (const tok of new Set(text.split(/[^a-z0-9]+/))) {
+        if (tok.length < 3 || tok.length > 30) continue;
+        let s = byToken.get(tok);
+        if (!s) byToken.set(tok, (s = new Set()));
+        s.add(p.domain);
+      }
+    }
+    this.tokenIndexCache = { byToken, domains: domains.size, pages: pages.length };
+    return this.tokenIndexCache;
+  }
+
   /** Cached page bodies, for corpus statistics (the word judge). */
   cachedPages(): Array<{ url: string; domain: string; body: string }> {
     return this.db
