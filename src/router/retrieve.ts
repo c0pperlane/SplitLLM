@@ -53,6 +53,29 @@ const RARE_DF_FRACTION = 0.05;
 const EVIDENCE_ALPHA = 0.08;
 
 /**
+ * How hard breadth is penalised. Chosen so the measured pair separates:
+ * redis (5%) keeps 0.67 of its score, connection (11%) keeps 0.48 — a 1.4x
+ * gap, enough to reorder them without silencing anything.
+ */
+/**
+ * Breadth at or below this is treated as fully specific. Measured: every real
+ * term of art sits here — pterodactyl 0%, wireguard 3%, crumb 3%, nginx 4%,
+ * flour 4%, redis 5% — while the glue starts at connection 11%.
+ */
+/**
+ * A query token on more than this share of known hostnames is not distinctive,
+ * whatever the module descriptions say. Function words of ANY language land
+ * here without a stopword list — which is the point, since the corpus learns
+ * pages in whatever language the user asks in.
+ */
+const MAX_TOKEN_BREADTH = 0.25;
+
+const SPECIFICITY_FLOOR = 0.06;
+
+/** Decay above the floor. connection (11%) keeps 0.57, support (39%) keeps 0.17. */
+const SPECIFICITY_K = 15;
+
+/**
  * Retrieve candidates for a set of query strings.
  *
  * All entities are searched, and their hit lists concatenated before fusion, so
@@ -90,7 +113,30 @@ export async function retrieveCandidates(
   const tokens = [...new Set(queries.flatMap((q) => tokenizeFts(q)))].slice(0, 24);
   const df = db.moduleDocFreq(tokens);
   const rareCap = Math.max(RARE_DF_MIN, Math.floor(Math.max(1, allModules.length) * RARE_DF_FRACTION));
-  const rareTokens = tokens.filter((t) => (df.get(t) ?? 0) <= rareCap);
+  /*
+   * A token is distinctive only if BOTH measures agree.
+   *
+   * Module document-frequency alone fails at scale, and measured here it fails
+   * badly. Module descriptions are short — many are empty — so ordinary English
+   * words appear in almost none of them and are scored as rare:
+   *
+   *   "what is the capital of france" -> rareTokens = [what is the capital of france]
+   *
+   * bm25 over those "distinctive" tokens then reached 3.78 and cleared the
+   * lexical floor, routing the query to ssl, css and web-hosting. This is the
+   * original atom-bomb bug wearing different clothes: vocabulary overlap
+   * mistaken for relevance.
+   *
+   * The page corpus knows better. "what" and "the" appear on nearly every
+   * hostname ever fetched; "crashloopbackoff" appears on a handful. Breadth is a
+   * fraction of hostnames, so it does not drift as the registry grows — the
+   * property module-df lacks, since description length has nothing to do with
+   * how common a word actually is.
+   */
+  const breadthOfTokens = db.termDomainBreadth(tokens);
+  const rareTokens = tokens.filter(
+    (t) => (df.get(t) ?? 0) <= rareCap && (breadthOfTokens.get(t) ?? 0) <= MAX_TOKEN_BREADTH,
+  );
 
   const bm25RareRaw: RankedHit[] = rareTokens.length > 0 ? db.searchFts(rareTokens.join(' '), opts.topK) : [];
 
@@ -109,16 +155,69 @@ export async function retrieveCandidates(
     if (m && !queryClaimsName(m, queryTokenSet)) unclaimed.add(id);
   }
 
+  /*
+   * Specificity weighting — the property that must hold at 10,000 modules.
+   *
+   * MEASURED FAILURE. "redis connection refused after reboot" selected
+   * `connection`, not `redis`:
+   *
+   *   connection  rrf 0.079  [bm25#1 bm25Rare#1 exact#2 vector#1]
+   *   redis       rrf 0.057  [bm25#2 bm25Rare#2 exact#1]
+   *
+   * Both are genuine exact-name matches — the query contains both words. The
+   * glue module wins by placing first in three lists at once, and RRF is purely
+   * rank-based, so it cannot see that one name is a term of art and the other
+   * is a word appearing on every second web page.
+   *
+   * Deleting `connection` would fix this one query and nothing else. At ten
+   * thousand modules there will be hundreds of such words, and the registry
+   * should keep them — `connection` is a real concept, merely a poor routing
+   * signal. So the correction belongs on the SCORE, not on the registry.
+   *
+   * Domain breadth supplies it: the share of known hostnames a term appears on.
+   * redis 5%, connection 11%, support 39%. It is a FRACTION, so it means the
+   * same thing at 150 modules and at 10,000 — unlike an absolute cosine floor,
+   * which this file already records drifting once the registry grew 20 -> 55.
+   */
+  const nameBreadth = db.termDomainBreadth(allModules.map((m) => m.name));
+  const specificity = (id: number): number => {
+    const m = byId.get(id);
+    if (!m) return 1;
+    /*
+     * A PENALTY for being common, never a BONUS for being obscure.
+     *
+     * The first version was 1/(1+k·breadth) with no floor, which handed a
+     * perfect score to anything nobody writes about. Measured, it promoted
+     * `nginx-module-redis-rate-limit` — 0% breadth, ONE page of evidence — over
+     * `redis` on "redis connection refused". Rarity is not relevance; a term
+     * can be rare because it is precise or because it is irrelevant, and
+     * breadth cannot tell those apart.
+     *
+     * So everything at or below the floor is treated identically, and only
+     * terms that are genuinely widespread are damped. `redis` (5%) and an
+     * obscure module (0%) both keep their full score and are then separated by
+     * evidence, which is the signal that actually distinguishes them.
+     */
+    const breadth = nameBreadth.get(m.name) ?? 0;
+    if (breadth <= SPECIFICITY_FLOOR) return 1;
+    return 1 / (1 + SPECIFICITY_K * (breadth - SPECIFICITY_FLOOR));
+  };
+
   const ground = (hits: readonly RankedHit[]): RankedHit[] =>
     hits
-      .map((h) => ({ id: h.id, score: unclaimed.has(h.id) ? h.score * UNCLAIMED_NAME_WEIGHT : h.score }))
+      .map((h) => ({
+        id: h.id,
+        score: (unclaimed.has(h.id) ? h.score * UNCLAIMED_NAME_WEIGHT : h.score) * specificity(h.id),
+      }))
       .sort((a, b) => b.score - a.score || a.id - b.id);
 
   const bm25Rare = ground(bm25RareRaw);
   const bm25List = ground(bm25Raw);
 
   // --- Exact name/alias occurrences ------------------------------------------
-  const exact = exactNameHits(allModules, queries[0] ?? '');
+  // The exact list needs it most: a term of art and a word that appears
+  // everywhere BOTH score 1.0 there, so unweighted it casts an equal vote.
+  const exact = ground(exactNameHits(allModules, queries[0] ?? ''));
 
   let vectorList: RankedHit[] = [];
   let embeddingUsed = false;
@@ -168,6 +267,12 @@ export async function retrieveCandidates(
   for (const hit of fused) {
     const d = docsOf(allModules, hit.id);
     hit.rrf *= 1 + EVIDENCE_ALPHA * Math.log1p(d);
+    // Applied to the FUSED mass, not only within each list. Weighting the
+    // individual lists merely reorders inside them, and a glue module that
+    // leads three lists outright survives that untouched — measured:
+    // `connection` stayed ahead of `redis` until the penalty reached the fused
+    // rank mass itself.
+    hit.rrf *= specificity(hit.id);
     hit.evidence = d;
   }
   fused.sort((a, b) => b.rrf - a.rrf || a.id - b.id);
