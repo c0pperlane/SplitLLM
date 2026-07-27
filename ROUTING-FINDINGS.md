@@ -150,16 +150,55 @@ Measured verdicts:
 | redis | no | yes | keep ✓ |
 | flour | yes | yes | keep ✓ |
 
-## What a real fix needs
+## Resolved: scale invariance, not pruning (2026-07-27)
 
-Neither dictionary presence nor heading-occurrence separates "ordinary word that
-happens to be near technical text" from "ordinary word that is genuinely this
-domain's term of art" (`flour`, `starter`, `dough`, `spring`). The signal that
-would work is probably **distribution across domains**: a term appearing in
-pages from many unrelated topics is glue; one concentrated in a few related
-domains is a subject. `edge_evidence` already stores per-domain provenance, so
-the data exists — it is not yet used this way.
+The mint gate above stops NEW glue. It does nothing about the 93 glue modules
+already minted, and deleting them was the wrong instinct — `connection` is a
+real concept and a poor routing signal, and at 10,000 modules there will be
+hundreds like it. The correction belongs on the SCORE.
 
-Until then the mitigation is at ROUTE time, not mint time: name-match grounding
-(shipped) stops these words winning unless the query actually claims them. That
-is why the battery holds at 14/16 rather than collapsing.
+Three fixes, all replacing a measure that drifts with registry size by one that
+is a FRACTION of the corpus:
+
+**1. Specificity weighting on the fused score.** `redis connection refused`
+selected `connection` — both are real exact-name matches, and the glue module
+won by leading three lists at once, which rank-based RRF cannot see through.
+Weighting per-list was not enough; the penalty had to reach the fused rank mass.
+
+It is a penalty for being COMMON, never a bonus for being obscure. The first
+version had no floor and promoted a module with 0% breadth and ONE page of
+evidence over `redis`. Rarity is not relevance.
+
+**2. Query tokens must be distinctive by BOTH measures.** Module descriptions
+are short, so ordinary English words appeared in almost none and scored as rare:
+`"what is the capital of france"` produced `rareTokens = [what is the capital of
+france]`, bm25 reached 3.78, and it routed to ssl/css/web-hosting. The
+atom-bomb bug in new clothes. Page-corpus breadth catches function words of any
+language with no stopword list.
+
+**3. The vector list is grounded too.** The embedding of "the whole table" was
+pulling `whole-grain` into a postgres answer. Safe because `unclaimed` only ever
+holds modules matched through their NAME — a description match never enters it,
+which is what German and paraphrase routing depend on.
+
+### Result, on the same 150-module graph the scale test degraded
+
+| | before fixes | after |
+|---|---|---|
+| random battery | 14/16 | **16/16** |
+| `npm run audit` | 25/29 | **29/29** |
+| unit tests | 233/233 | 233/233 |
+
+Every top-ranked module is now correct: redis, pterodactyl, nginx, php,
+sourdough, flour, postgresql. No modules were deleted.
+
+### What was tried and rejected
+
+- **Ratio (top/median) instead of prominence** for the semantic gate: separates
+  the sample but with ~3% margin against prominence's ~14%. Rejected on margin.
+- **z-score** `(top-median)/(p90-median)`: does not separate at all — 2.11 for a
+  wrong route against 2.17 for a right one.
+- **Deleting glue modules**: would remove `starter` (a working sourdough module,
+  12% breadth) to catch `connection` (11%), and would not fix the audit failures
+  anyway, since `modules`/`load`/`make` inherit protection from install-command
+  evidence on edges they merely touch.
