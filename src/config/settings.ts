@@ -86,17 +86,28 @@ export interface Settings {
   maxPagesPerLearn: number;
   /** Process priority for the Ollama server, where the OS supports it. */
   lowPriority: boolean;
+  /**
+   * System-prompt size. 0 = auto (pick from model size), 1..4 = compact,
+   * standard, full, max.
+   *
+   * Stored as a number so it fits the existing numeric slider machinery rather
+   * than needing a parallel string-valued settings path.
+   */
+  promptTier: number;
 }
 
 export function defaultSettings(): Settings {
   return {
     cpuPercent: defaultCpuPercent(),
-    numCtx: 8192,
+    // 16k default: room for the always-on system prompt, a routed CONTEXT
+    // block and a real conversation without the oldest turns sliding out.
+    numCtx: 16384,
     maxTokens: 1200,
     keepAliveMinutes: 30,
     maxModules: 12,
     maxPagesPerLearn: 6,
     lowPriority: true,
+    promptTier: 0,
   };
 }
 
@@ -144,11 +155,15 @@ export function settingSpecs(): SettingSpec[] {
     {
       key: 'numCtx',
       label: 'Context limit',
-      min: 2048,
-      // The model advertises 262144 natively, but each step costs KV cache and
-      // the panel now shows that cost live — so the ceiling can be generous
-      // without being a trap.
-      max: 65536,
+      // 4096 floor, deliberately. The always-on system prompt is ~800 tokens at
+      // its fullest; at a 2048 window that is 40% of everything the model can
+      // see before the conversation even starts, which starves the actual task.
+      // A floor below the prompt's own working size is not a usable setting.
+      min: 4096,
+      // The model advertises 262144 natively. The ceiling is generous because
+      // the panel shows the KV cost live, so a large value is an informed
+      // choice rather than a trap.
+      max: 131072,
       step: 2048,
       unit: 'tok',
       // KV-cache growth for a 4B Q4 model is roughly 80 KB per 1k tokens of
@@ -202,6 +217,19 @@ export function settingSpecs(): SettingSpec[] {
       help: 'More pages means better graph coverage and slower learning.',
     },
     {
+      key: 'promptTier',
+      label: 'System prompt size',
+      min: 0,
+      max: 4,
+      step: 1,
+      unit: '',
+      format: (v) => {
+        const names = ['auto — from model size', 'compact ~780 tok', 'standard ~1900 tok', 'full ~2370 tok', 'max ~2800 tok — every rule, worked examples'];
+        return names[v as number] ?? 'auto';
+      },
+      help: 'Bigger carries more design rules and worked failure examples. Costs context on every turn.',
+    },
+    {
       key: 'lowPriority',
       label: 'Low-priority inference',
       min: 0,
@@ -245,6 +273,11 @@ export function saveSettings(s: Settings): void {
   } catch {
     // A read-only working directory must not break the session.
   }
+}
+
+/** The chosen prompt tier, or undefined to let the model size decide. */
+export function tierSetting(s: Settings): string | undefined {
+  return ([undefined, 'compact', 'standard', 'full', 'max'] as const)[s.promptTier];
 }
 
 export function settingsFile(): string {

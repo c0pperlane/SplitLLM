@@ -26,7 +26,7 @@ import { anySubject, dictionaryPosFetcher } from '../learn/wordclass.ts';
 import { color, renderGraph, renderTrace, renderWhy } from './debug.ts';
 import type { RouteTrace } from '../router/pipeline.ts';
 import { describeSettings, showPerformancePanel } from './performance.ts';
-import { coreCount, getSettings, threadsFor } from '../config/settings.ts';
+import { coreCount, getSettings, threadsFor, tierSetting } from '../config/settings.ts';
 import { runDesignCommand, runSiteCommand, runVerifyCommand } from './design-cmd.ts';
 import { readFileSync } from 'node:fs';
 import { MODES, describeMode, canWrite, type PermissionMode } from './permissions.ts';
@@ -60,6 +60,9 @@ import {
 /** Tools the model is told it has when permissions allow writing. */
 const AGENT_TOOL_NAMES = ['list_files', 'read_file', 'write_file', 'edit_file', 'verify'];
 
+/** The subset that a read-only session can actually complete. */
+const READONLY_TOOL_NAMES = ['list_files', 'read_file', 'verify'];
+
 /** Base thresholds with the user's performance settings folded in. */
 function activeThresholds(): typeof DEFAULT_THRESHOLDS {
   const s = getSettings();
@@ -91,6 +94,10 @@ interface Session {
  * deliberate — see prompt/system.ts for the measurement behind it.
  */
 function promptTier(ctx: Ctx): PromptTier {
+  // An explicit choice in /performance always wins. Auto only guesses from the
+  // model's parameter count, which is absent for every remote endpoint.
+  const chosen = tierSetting(getSettings());
+  if (chosen) return chosen as PromptTier;
   return tierForModel(ctx.session.caps?.parameterSize);
 }
 
@@ -905,7 +912,16 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
       task: 'build',
       tier: promptTier(ctx),
       medium: detectMedium(query),
-      tools: canWrite(session.permissions) ? AGENT_TOOL_NAMES : undefined,
+      // The SKILLS are unconditional — design invariants, verification
+      // discipline and the agentic method are in every prompt regardless of
+      // mode. What varies is only the tool LIST, which must match what the
+      // sandbox will actually permit: telling a read-only session it has
+      // `write_file` produces a call that gets refused, and the model then
+      // treats the refusal as a bug in its own arguments and retries.
+      //
+      // (`canWrite` returns a decision OBJECT, not a boolean. `canWrite(x) ? …`
+      //  is therefore always truthy — read `.allowed`.)
+      tools: canWrite(session.permissions).allowed ? AGENT_TOOL_NAMES : READONLY_TOOL_NAMES,
       context: result.context || undefined,
     }).text;
 

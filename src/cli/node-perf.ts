@@ -123,7 +123,9 @@ function specsFor(ep: Endpoint): NodeSpec[] {
       key: 'numCtx',
       label: 'Context limit',
       min: AUTO,
-      max: 65536,
+      // Matches the local ceiling. A node with more RAM than this laptop should
+      // not be capped by this laptop's idea of a sensible maximum.
+      max: 131072,
       step: 2048,
       format: (v) =>
         v <= 0

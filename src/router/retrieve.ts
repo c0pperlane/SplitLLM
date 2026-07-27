@@ -74,7 +74,7 @@ export async function retrieveCandidates(
     }
   }
 
-  const bm25List: RankedHit[] = [...bm25.entries()]
+  const bm25Raw: RankedHit[] = [...bm25.entries()]
     .map(([id, score]) => ({ id, score }))
     .sort((a, b) => b.score - a.score)
     .slice(0, opts.topK);
@@ -92,7 +92,30 @@ export async function retrieveCandidates(
   const rareCap = Math.max(RARE_DF_MIN, Math.floor(Math.max(1, allModules.length) * RARE_DF_FRACTION));
   const rareTokens = tokens.filter((t) => (df.get(t) ?? 0) <= rareCap);
 
-  const bm25Rare: RankedHit[] = rareTokens.length > 0 ? db.searchFts(rareTokens.join(' '), opts.topK) : [];
+  const bm25RareRaw: RankedHit[] = rareTokens.length > 0 ? db.searchFts(rareTokens.join(' '), opts.topK) : [];
+
+  // --- Name-match grounding ---------------------------------------------
+  //
+  // Only modules reached THROUGH THEIR NAME are checked, and only those the
+  // query does not actually claim. A description match is left alone entirely,
+  // because that is how paraphrases and other languages route.
+  const queryTokenSet = new Set(tokens);
+  const byId = new Map(allModules.map((m) => [m.id, m]));
+  const joined = queries.join(' ');
+  const nameMatched = new Set(db.searchFtsName(joined, opts.topK * 2).map((h) => h.id));
+  const unclaimed = new Set<number>();
+  for (const id of nameMatched) {
+    const m = byId.get(id);
+    if (m && !queryClaimsName(m, queryTokenSet)) unclaimed.add(id);
+  }
+
+  const ground = (hits: readonly RankedHit[]): RankedHit[] =>
+    hits
+      .map((h) => ({ id: h.id, score: unclaimed.has(h.id) ? h.score * UNCLAIMED_NAME_WEIGHT : h.score }))
+      .sort((a, b) => b.score - a.score || a.id - b.id);
+
+  const bm25Rare = ground(bm25RareRaw);
+  const bm25List = ground(bm25Raw);
 
   // --- Exact name/alias occurrences ------------------------------------------
   const exact = exactNameHits(allModules, queries[0] ?? '');
@@ -164,6 +187,57 @@ function docsOf(modules: readonly ModuleRow[], id: number): number {
  * precise routing signal that exists, and free to compute. Alias hits count
  * slightly less (0.8): they are a name the module is known by, not the name.
  */
+/**
+ * Does the query actually CLAIM this module's name, rather than merely stemming
+ * onto it?
+ *
+ * MEASURED FAILURES this exists for, on a 57-module corpus that `/learn` had
+ * grown from baking pages:
+ *
+ *   "why are my tomato plant leaves curling"      -> curl         (6.2)
+ *   "postgres vacuum full locks the whole table"  -> whole-grain  (7.1)
+ *
+ * Neither is a threshold problem. FTS5's Porter stemmer maps `curling` onto
+ * `curl`, and its tokenizer lets the ordinary word `whole` reach `whole-grain`.
+ * The retriever behaved correctly on a corpus where ordinary English words
+ * (`go`, `spring`, `salt`, `starter`, `crumb`, `whole-grain`) had been promoted
+ * to first-class module names.
+ *
+ * The rule is deliberately narrow, because a WIDER version of this check broke
+ * cross-language routing on the first attempt: it demanded the query name every
+ * module it matched, which killed "wie backe ich ein brot" -> `dough`. A module
+ * matching through its DESCRIPTION is the healthy case and is never touched
+ * here. Only a NAME-field match has to be claimed.
+ *
+ * Claimed means:
+ *   - the name appears verbatim as a query token (`redis` in "redis refused"), or
+ *   - for a hyphenated name, EVERY part appears ("whole grain flour" claims
+ *     `whole-grain`; "the whole table" does not).
+ */
+export function queryClaimsName(m: ModuleRow, queryTokens: ReadonlySet<string>): boolean {
+  // Aliases are stored SPACE-separated in practice ("ptero pterodactyl-panel
+  // game panel"), not comma-separated. Splitting only on punctuation treats
+  // that whole string as a single alias, so the query token `panel` never
+  // matches it — which silently un-claimed pterodactyl and turned a correct
+  // route into a knowledge gap.
+  const names = [m.name, ...m.aliases.split(/[\s,;|]+/)]
+    .map((n) => n.trim().toLowerCase())
+    .filter((n) => n.length >= 2);
+
+  for (const name of names) {
+    if (queryTokens.has(name)) return true;
+    if (name.includes('-')) {
+      const parts = name.split('-').filter((p) => p.length >= 2);
+      // Every part, not any part — "whole" alone must not claim "whole-grain".
+      if (parts.length > 1 && parts.every((p) => queryTokens.has(p))) return true;
+    }
+  }
+  return false;
+}
+
+/** What an unclaimed name-only match is worth: enough to assist, never to win. */
+export const UNCLAIMED_NAME_WEIGHT = 0.2;
+
 export function exactNameHits(modules: readonly ModuleRow[], rawQuery: string): RankedHit[] {
   const padded = ` ${rawQuery.toLowerCase().replace(/[^a-z0-9+#.\-_]+/g, ' ').replace(/\s+/g, ' ')} `;
   const hits: RankedHit[] = [];

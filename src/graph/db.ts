@@ -264,6 +264,42 @@ export class GraphDb {
    * BM25 search. SQLite returns bm25() as a NEGATIVE number where more negative
    * is a better match, so we negate it to get an ascending-is-worse score.
    */
+  /**
+   * Modules whose NAME or ALIASES match — description deliberately excluded.
+   *
+   * The distinction is load-bearing. A module matching through its description
+   * is the normal, healthy case: it is how "wie backe ich ein brot" reaches
+   * `dough`, and how any paraphrase or non-English query reaches anything. A
+   * module matching only through its NAME is the suspicious case, because FTS5
+   * stems: `curling` matches a module called `curl`, and `whole` matches one
+   * called `whole-grain`. Both were observed routing wrongly on a corpus where
+   * `/learn` had minted ordinary English words (`go`, `spring`, `salt`,
+   * `starter`, `whole-grain`) as module names.
+   *
+   * Separating the two is what lets the name case be checked strictly without
+   * touching the description case at all.
+   */
+  searchFtsName(query: string, limit: number): Array<{ id: number; score: number }> {
+    const match = ftsQuery(query);
+    if (!match) return [];
+    try {
+      // FTS5 column filter: restrict the whole expression to name + aliases.
+      const scoped = `{name aliases} : (${match})`;
+      const rows = this.db
+        .prepare(
+          `SELECT rowid AS id, bm25(module_fts, 4.0, 3.0, 2.0, 1.0) AS raw
+             FROM module_fts
+            WHERE module_fts MATCH ?
+            ORDER BY raw
+            LIMIT ?`,
+        )
+        .all(scoped, limit) as Array<{ id: number; raw: number }>;
+      return rows.map((r) => ({ id: r.id, score: -r.raw }));
+    } catch {
+      return [];
+    }
+  }
+
   searchFts(query: string, limit: number): Array<{ id: number; score: number }> {
     const match = ftsQuery(query);
     if (!match) return [];

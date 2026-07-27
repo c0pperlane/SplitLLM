@@ -24,3 +24,6 @@ site.html
 skeleton-test.html
 shot-*.png
 deploy/.env
+splitllm.db.backup-*
+scale-test.log
+tmp-*.ts

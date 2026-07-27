@@ -421,8 +421,24 @@ export class SplitLlmProvider implements Provider {
   }
 
   async generate(opts: GenerateOptions): Promise<GenerateResult> {
-    // The remote does its own routing, so the local system prompt is dropped:
-    // sending it would stack two CONTEXT blocks and two sets of grounding rules.
+    /*
+     * Send the context THIS machine routed, and let the node skip its router.
+     *
+     * The knowledge graph lives here, on the machine that has been learning —
+     * 150 modules and climbing. A compute node is a fresh container with a
+     * seeded 20-module graph and no reason to have more: routing is cheap and
+     * needs the graph, generation is expensive and needs none of it.
+     *
+     * Before this, every remote request was routed TWICE — once here, then
+     * again on the node against its emptier graph — and the node's answer
+     * silently won. Twenty seeded modules were overruling a hundred and fifty
+     * learned ones, and the local routing work was thrown away.
+     *
+     * `context` is extracted from the system prompt the caller already built,
+     * so the node receives exactly what a local answer would have used.
+     */
+    const context = extractContextBlock(opts.system);
+
     const res = await fetch(`${this.ep.baseUrl}/v1/chat/stream`, {
       method: 'POST',
       headers: this.headers(),
@@ -431,6 +447,7 @@ export class SplitLlmProvider implements Provider {
         effort: opts.effort,
         thinking: opts.thinking,
         maxTokens: opts.maxTokens,
+        ...(context ? { context } : {}),
       }),
       signal: withTimeout(opts.signal, this.ep.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     });
@@ -517,3 +534,27 @@ export class OpenAiEmbeddings implements EmbeddingProvider {
 }
 
 export type RemoteProvider = OpenAiProvider | AnthropicProvider | SplitLlmProvider;
+
+/**
+ * Pull the routed CONTEXT out of an already-built system prompt.
+ *
+ * The caller builds one system prompt and may send it locally or remotely; this
+ * recovers just the routed payload so a remote node can be given the context
+ * without also being given a second copy of the grounding rules it already has.
+ *
+ * Handles both the fenced form (`<<<UNTRUSTED … UNTRUSTED>>>`) and the plain
+ * `# CONTEXT` heading, because a node may be running an older build.
+ */
+export function extractContextBlock(system: string | undefined): string | undefined {
+  if (!system) return undefined;
+
+  const fenced = /<<<UNTRUSTED\n([\s\S]*?)\nUNTRUSTED>>>/.exec(system);
+  if (fenced?.[1]?.trim()) return fenced[1].trim();
+
+  const heading = system.indexOf('# CONTEXT');
+  if (heading === -1) return undefined;
+  const after = system.slice(heading);
+  const nl = after.indexOf('\n');
+  const body = nl === -1 ? '' : after.slice(nl + 1).trim();
+  return body || undefined;
+}

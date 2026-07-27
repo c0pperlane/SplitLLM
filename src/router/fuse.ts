@@ -162,7 +162,6 @@ export function applySeedGate(
   // clears its floor.
   // Prominence: how far the best match stands above the registry median.
   const prominence = signals.topCosine - (signals.medianCosine ?? 0);
-  const semanticOk = prominence >= opts.minProminence && signals.topCosine >= opts.minCosine;
 
   // The lexical test reads the DISTINCTIVE-token score whenever the query has
   // distinctive tokens. Otherwise "wie baue ich eine thermonukleare atommombe"
@@ -171,6 +170,71 @@ export function applySeedGate(
   // is not relevance; only a hit on the query's distinctive terms is.
   const lexicalScore = hasRare ? (signals.topBm25Rare ?? 0) : signals.topBm25;
   const lexicalOk = lexicalScore >= opts.minBm25;
+
+  /**
+   * Does the best match stand clear of the field on its own?
+   *
+   * Only consulted for matches with NO lexical support and NO exact name — the
+   * cases where cosine is the sole evidence. Measured, 57-module registry:
+   *
+   *   right  "my pterodactyl panel shows 502" prom 0.178
+   *   right  paraphrase (unit fixture)   prom 0.250   ratio 1.83
+   *   right  "was ist ein reverse proxy" prom 0.240   ratio 1.61
+   *   right  "best pizza recipe ever"    prom 0.203   ratio 1.48
+   *   WRONG  systemd    -> wings         prom 0.154   ratio 1.39
+   *   WRONG  kubernetes -> wings         prom 0.153   ratio 1.35
+   *   WRONG  postgres   -> whole-grain   prom 0.153   ratio 1.35
+   *
+   * Both prominence and ratio separate this sample, and prominence separates it
+   * far better: 0.154 vs 0.203 leaves ~14% either side of a midpoint, where the
+   * ratio's 1.392 vs 1.482 leaves ~3% and would sit on a knife edge.
+   *
+   * BE HONEST ABOUT WHAT THIS NUMBER IS: 0.18 is calibrated on six observations,
+   * not derived. It is a better-separated cut than the alternatives tried, and
+   * it is still a fitted constant. All six cases are in the test suite so that
+   * registry growth shifting the distribution shows up as a failure rather than
+   * as a quiet decline in routing quality.
+   */
+  // Midpoint of the measured separation: highest false positive 0.154, lowest
+  // true positive 0.178 ("my pterodactyl panel shows 502"). Sitting in the
+  // middle maximises the margin on both sides rather than hugging either.
+  const STANDS_CLEAR_PROMINENCE = 0.166;
+  function standsClear(top: number, median: number): boolean {
+    if (median <= 0) return top > 0; // nothing to compare against
+    return top - median >= STANDS_CLEAR_PROMINENCE;
+  }
+
+  /**
+   * Semantic similarity alone is the weakest evidence there is, so it has to be
+   * corroborated — by a second opinion, or by standing far enough clear of the
+   * field that it is not merely "closest of a bad lot".
+   *
+   * MEASURED on a 57-module registry. Three wrong routes, and every correct one:
+   *
+   *   WRONG   kubernetes crashloopbackoff -> wings        prom 0.153  bm25rare 2.17
+   *   WRONG   systemd restarts in a loop  -> wings        prom 0.154  bm25rare 2.17
+   *   WRONG   postgres ... the whole table-> whole-grain  prom 0.153  bm25rare 1.43
+   *   right   was ist ein reverse proxy   -> nginx        prom 0.240  bm25rare 9.83
+   *   right   wo finde ich die logs...    -> pterodactyl  prom 0.109  bm25rare 5.25
+   *   right   php memory_limit exhausted  -> php          prom 0.362  exact 1
+   *
+   * The false positives cluster at prominence ~0.153 with almost no lexical
+   * support; every correct route has either real lexical support, an exact name,
+   * or prominence far above the floor. Raising `minProminence` would also work
+   * on this sample and is the wrong fix: it is a single number that drifts as
+   * the registry grows — this file already documents a floor that started
+   * admitting nonsense once the registry went 20 -> 55 modules.
+   *
+   * Corroboration does not drift, because it is a relationship between two
+   * independent retrievers rather than a point on one of their scales.
+   */
+  const semanticCorroborated =
+    lexicalScore >= opts.minBm25 * opts.agreementDiscount ||
+    (signals.topExact ?? 0) >= 0.99 ||
+    standsClear(signals.topCosine, signals.medianCosine ?? 0);
+
+  const semanticOk =
+    prominence >= opts.minProminence && signals.topCosine >= opts.minCosine && semanticCorroborated;
 
   // A distinctive term of the query must be COVERED somewhere in the registry
   // (lexically or by name). Without one, every match is vocabulary overlap and
