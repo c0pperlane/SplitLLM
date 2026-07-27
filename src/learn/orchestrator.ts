@@ -8,6 +8,7 @@
  */
 
 import type { GraphDb } from '../graph/db.ts';
+import { tokenizeFts } from '../graph/db.ts';
 import { ingestPage, recomputeAllEdges } from '../graph/edges.ts';
 import { extractPage, buildLexicon, type PageExtraction } from './parse.ts';
 import { fetchPage } from './fetch.ts';
@@ -142,6 +143,41 @@ export async function learn(
 
     const extraction = extractPage(page.html, lexicon);
 
+    /*
+     * The SUBJECT of the learn cycle must become a module.
+     *
+     * MEASURED, and it defeats the whole point of learning. The scale test
+     * logged `37. terraform state locking  +32 mod` — thirty-two modules from
+     * that cycle — and `terraform` was not one of them. Nor were `zfs`, `esp32`,
+     * `grpc`, `prometheus` or `ansible` after learning about each of them.
+     * Asking the router about terraform afterwards still returned a knowledge
+     * gap, so the same cycle would run again forever.
+     *
+     * The cause is that the deterministic extractors fire on INSTALL COMMANDS,
+     * which is why the registry filled with `kmod-wireguard`, `linux-headers`,
+     * `python-venv`, `software-properties` and `nginx-module-testcookie`: real
+     * packages mentioned on the page, none of them what was being learned.
+     *
+     * So the topic's own distinctive words are injected as high-confidence
+     * terms. Distinctive by the same corpus breadth measure used everywhere
+     * else — "terraform" survives, "state" and "locking" do not — so this adds
+     * the subject without also minting the glue around it.
+     */
+    const subjectTerms = topicSubjects(db, topic);
+    for (const term of subjectTerms) {
+      const prev = extraction.terms.get(term);
+      if (!prev) {
+        extraction.terms.set(term, {
+          // Above PROSE_ONLY_CEILING: the user naming it IS the evidence, and
+          // it must not then be rejected as prose noise by the mint gate.
+          confidence: 0.9,
+          contextTag: 'learn-subject',
+          extractor: 'topic',
+          snippet: extraction.page.title || topic,
+        });
+      }
+    }
+
     // General-domain discovery: the deterministic extractors only fire on
     // install commands and known vocabulary, so a page about baking yields
     // nothing. Ask the model for concepts, grounded against the page text.
@@ -250,3 +286,28 @@ function rejectGlueTerms(
   }
   return rejected;
 }
+
+/**
+ * The distinctive words of the topic being learned.
+ *
+ * These become modules regardless of what the scraped pages happen to contain,
+ * because the user naming a subject is itself the evidence that it is one.
+ *
+ * Filtered by the same corpus-breadth measure the router uses, so "terraform
+ * state locking" yields `terraform` and drops `state` and `locking`. Without
+ * that filter this would mint the glue it is meant to avoid.
+ */
+function topicSubjects(db: GraphDb, topic: string): string[] {
+  const tokens = [...new Set(tokenizeFts(topic))].filter((t) => t.length >= 3);
+  if (tokens.length === 0) return [];
+  const breadth = db.termDomainBreadth(tokens);
+  const distinctive = tokens.filter((t) => (breadth.get(t) ?? 0) <= SUBJECT_MAX_BREADTH);
+  // Cap it: a long question should not mint six modules. Rarest first, so the
+  // most specific words win when the topic is wordy.
+  return distinctive
+    .sort((a, b) => (breadth.get(a) ?? 0) - (breadth.get(b) ?? 0))
+    .slice(0, 2);
+}
+
+/** Same floor the router treats as fully specific. */
+const SUBJECT_MAX_BREADTH = 0.06;
