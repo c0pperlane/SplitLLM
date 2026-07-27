@@ -16,11 +16,19 @@ services:
     image: splitllm-v2:latest
     container_name: splitllm-v2
     restart: unless-stopped
-    # Loopback only. The path in is the WireGuard tunnel plus nginx, not a port
-    # open to the internet — publishing 0.0.0.0:8080 here would quietly bypass
-    # every access control in front of it.
+    # Which interface the port is published on.
+    #
+    # Loopback by default, because a fresh install should not be reachable from
+    # anywhere until someone decides otherwise. A node fronted by a reverse
+    # proxy on ANOTHER machine has to bind the interface that proxy can reach —
+    # for the WireGuard setup here that is `SPLITLLM_BIND_ADDR=10.7.0.2`, which
+    # exposes it on the tunnel and nowhere else.
+    #
+    # Deliberately not 0.0.0.0: that publishes on every interface the host has,
+    # including any public one, which is how an authenticated-but-private
+    # service quietly becomes an internet-facing one.
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${SPLITLLM_BIND_ADDR:-127.0.0.1}:${SPLITLLM_PORT:-8080}:8080"
     environment:
       SPLITLLM_API_TOKEN: ${SPLITLLM_API_TOKEN:?set SPLITLLM_API_TOKEN in .env}
       SPLITLLM_MODEL: ${SPLITLLM_MODEL:-qwen3:4b}
