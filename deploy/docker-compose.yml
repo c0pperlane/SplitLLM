@@ -52,11 +52,22 @@ services:
     # A 4B model on CPU will take every core it is given. Leaving headroom is
     # not politeness: this box also runs Wings, and a starved Wings drops the
     # panel websocket.
-    deploy:
-      resources:
-        limits:
-          cpus: "${SPLITLLM_CPUS:-6}"
-          memory: ${SPLITLLM_MEMORY:-8g}
+    # Top-level `cpus`/`mem_limit`, NOT `deploy.resources.limits`.
+    #
+    # `deploy:` is Swarm-only. `docker compose up` parses it, applies nothing,
+    # and reports no error — so this file promised a 6-core cap and ran
+    # unbounded. Caught by the node's own /health: it reports `cores` from the
+    # cgroup quota and `hostCores` from the kernel, and both read 32.
+    #
+    # This matters here specifically. The host also runs Wings and several game
+    # servers, and an unbounded Ollama will take every core it can reach — on a
+    # box with a history of falling over under load, that is a contributor
+    # whether or not it is the original cause.
+    cpus: ${SPLITLLM_CPUS:-6}
+    mem_limit: ${SPLITLLM_MEMORY:-8g}
+    # Restart the container if it exceeds the memory cap rather than letting the
+    # kernel OOM-killer pick a victim, which on this host might be a game server.
+    oom_kill_disable: false
 
 volumes:
   splitllm-data:
