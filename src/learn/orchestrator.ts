@@ -108,8 +108,15 @@ export async function learn(
   opts: LearnOptions,
 ): Promise<LearnResult> {
   const th = applyEffort(opts.thresholds, opts.effort);
-  // The graph itself supplies the rarity signal that picks the head term.
-  const queries = expandQueries(topic, (terms) => db.termDomainBreadth(terms));
+  // The graph supplies the rarity signal, but only for terms that are actual
+  // MODULES. Plain corpus presence is too weak a filter: measured against the
+  // real graph it made "evil" the head of "are cows evil", because the word
+  // appears on one scraped page and "cows" appears on none.
+  const moduleNames = new Set(db.allModules().map((m) => m.name.toLowerCase()));
+  const queries = expandQueries(topic, (terms) => {
+    const breadth = db.termDomainBreadth(terms);
+    return new Map([...breadth].filter(([t]) => moduleNames.has(t)));
+  });
 
   const result: LearnResult = {
     topic,

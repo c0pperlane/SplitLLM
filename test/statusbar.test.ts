@@ -204,3 +204,19 @@ test('the status bar never exceeds the window width', () => {
     bar.detach();
   }
 });
+
+test('teardown restores the cursor after resetting the scroll region', () => {
+  // `ESC[r` HOMES the cursor. Unguarded, everything printed after teardown
+  // starts at row 1 — which is how exiting wrote "bye" on top of the banner.
+  const bar = new StatusBar();
+  bar.attach();
+  const mark = written.length;
+  bar.detach();
+  const out = since(mark);
+  const reset = out.indexOf(`${ESC}[r`);
+  assert.ok(reset > 0, 'scroll region was never reset');
+  assert.ok(
+    out.slice(reset).includes(`${ESC}8`),
+    'no cursor restore after the region reset — output will land at row 1',
+  );
+});

@@ -123,7 +123,7 @@ export class StatusBar {
     this.palette = [];
     this.clearRow();
     this.prompting = false; // the panel owns the cursor now; DECSC is released
-    stdout.write(`${ESC}[r`);
+    stdout.write(`${SAVE}${ESC}[r${RESTORE}`); // the reset homes the cursor
   }
 
   resume(): void {
@@ -146,7 +146,11 @@ export class StatusBar {
     if (this.timer) clearInterval(this.timer);
     stdout.removeListener('resize', this.onResize);
     this.clearRow();
-    stdout.write(`${ESC}[r`); // restore the full window
+    // Resetting the scroll region HOMES THE CURSOR. Without saving around it,
+    // everything printed after teardown starts at row 1 and lands on top of the
+    // banner — which is why exiting wrote "bye" over "cpu: 8/10 cores" instead
+    // of below the conversation.
+    stdout.write(`${SAVE}${ESC}[r${RESTORE}`);
   }
 
   // ── The reserved zone ───────────────────────────────────────────────────

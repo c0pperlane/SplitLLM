@@ -104,12 +104,15 @@ export function stripQuery(raw: string, rarity?: Rarity): StrippedQuery {
   // the head whichever word the graph happens NOT to know.
   const known = candidates.filter((t) => (breadth.get(t) ?? 0) > 0);
 
-  // One known term out of several is not a ranking — it is the only word there
-  // was data for. On "are cows evil" that picked "evil", because it appears on
-  // one scraped domain and "cows" appears on none; searching "evil" alone finds
-  // nothing about cows. Comparing needs at least two things to compare, and
-  // without that the content phrase is already the better query.
-  if (known.length < 2) return result;
+  // Nothing the caller vouches for: no basis to narrow, so do not pretend.
+  //
+  // What counts as "known" is the CALLER's decision and it matters more than
+  // the ranking does. Measured against the real graph, plain corpus presence
+  // chose "evil" over "cows" — "evil" happened to appear on one scraped page
+  // and "cows" on none — which would have searched for the adjective. The
+  // orchestrator therefore reports breadth only for terms that are actual
+  // modules, so an incidental word cannot become the subject.
+  if (known.length === 0) return result;
 
   let best = known[0]!;
   for (const t of known) if (breadth.get(t)! < breadth.get(best)!) best = t;
