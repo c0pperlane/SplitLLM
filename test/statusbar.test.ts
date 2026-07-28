@@ -11,6 +11,7 @@ import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { stdout } from 'node:process';
 import { StatusBar } from '../src/cli/statusbar.ts';
+import { displayWidth } from '../src/cli/screen.ts';
 
 const ESC = '\x1b';
 const ROWS = 30;
@@ -176,4 +177,30 @@ test('a tiny window offers no palette rather than a one-row one', () => {
   bar.attach();
   assert.equal(bar.paletteCapacity(), 1); // below the 3 the caller requires
   bar.detach();
+});
+
+test('the status bar never exceeds the window width', () => {
+  // It budgeted against a plain-text twin of each segment while printing the
+  // painted one, which also carries the 8- and 6-cell meters: 11 columns per
+  // segment unaccounted for. The line ran ~55 columns over and WRAPPED, and a
+  // wrap on the last row scrolls the whole screen — that is what put a doubled
+  // status bar inside the transcript and printed "bye" over the banner.
+  for (const cols of [40, 60, 80, 100, 120, 200]) {
+    written = [];
+    Object.defineProperty(stdout, 'columns', { value: cols, configurable: true });
+    const bar = new StatusBar();
+    bar.attach();
+    bar.set({
+      endpoint: 'local', model: 'huihui_ai/qwen3.5-abliterated:4B',
+      contextUsed: 3600, contextLimit: 24600, tokensIn: 3100, tokensOut: 9,
+      tps: 12.4, busy: true, note: 'learning',
+    });
+    const painted = written.join('').split(`${ESC}[2K`).pop() ?? '';
+    const line = painted.replace(/\x1b\[\d+;\d+H|\x1b[78]/g, '');
+    assert.ok(
+      displayWidth(line) < cols,
+      `at ${cols} cols the bar is ${displayWidth(line)} wide: ${JSON.stringify(line)}`,
+    );
+    bar.detach();
+  }
 });

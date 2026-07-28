@@ -13,6 +13,7 @@ import { ingestPage, recomputeAllEdges } from '../graph/edges.ts';
 import { extractPage, buildLexicon, type PageExtraction } from './parse.ts';
 import { fetchPage } from './fetch.ts';
 import { searchAll } from './search/index.ts';
+import { stripQuery, type Rarity } from './query.ts';
 import type { EngineHealth } from './search/types.ts';
 import { applyEffort, type Effort, type Thresholds } from '../router/thresholds.ts';
 import { extractConcepts } from './concepts.ts';
@@ -63,12 +64,43 @@ const TECHNICAL_HINT =
  * useful and waste the page budget. Technical topics get dependency-shaped
  * expansions, everything else gets explanatory ones.
  */
-export function expandQueries(topic: string): string[] {
+export function expandQueries(topic: string, rarity?: Rarity): string[] {
   const t = topic.trim().replace(/\s+/g, ' ').slice(0, 80);
-  return TECHNICAL_HINT.test(t)
-    ? [t, `${t} dependencies`, `${t} install requirements`]
-    : [t, `${t} explained`, `${t} guide basics`];
+  const q = stripQuery(t, rarity);
+
+  // Topic-shaped follow-ups hang off the CONTENT words, not the raw question.
+  // Built on the question they produced "are cows evil? guide basics", which
+  // matches nothing — the noise was being carried into every expansion.
+  const base = q.content;
+  const shaped = TECHNICAL_HINT.test(t)
+    ? [`${base} dependencies`, `${base} install requirements`]
+    : [`${base} explained`, `${base} guide basics`];
+
+  // Priority order. Dedupe collapses them for a topic that is already bare, so
+  // `pterodactyl` still yields the two shaped expansions rather than three
+  // copies of itself, and the page budget is unchanged either way.
+  const ordered = [q.original, q.content, ...(q.head ? [q.head] : []), ...shaped];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of ordered) {
+    const k = s.trim();
+    if (k === '' || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+    if (out.length === MAX_QUERIES) break;
+  }
+  return out;
 }
+
+/**
+ * Queries per learn cycle.
+ *
+ * Held at the previous value on purpose. Stripping produces more USEFUL
+ * variants, not more of them — each one is a search round trip, and the page
+ * budget they feed is fixed, so a fourth query would mostly re-rank the same
+ * candidates for the cost of another request.
+ */
+const MAX_QUERIES = 3;
 
 export async function learn(
   db: GraphDb,
@@ -76,7 +108,8 @@ export async function learn(
   opts: LearnOptions,
 ): Promise<LearnResult> {
   const th = applyEffort(opts.thresholds, opts.effort);
-  const queries = expandQueries(topic);
+  // The graph itself supplies the rarity signal that picks the head term.
+  const queries = expandQueries(topic, (terms) => db.termDomainBreadth(terms));
 
   const result: LearnResult = {
     topic,

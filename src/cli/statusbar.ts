@@ -44,7 +44,7 @@ import { color } from './debug.ts';
 import { fmtCount } from './status.ts';
 import { coreCount } from '../config/settings.ts';
 import { cpuBusyFraction } from './cpu.ts';
-import { fitWidth } from './screen.ts';
+import { displayWidth, fitWidth } from './screen.ts';
 
 const ESC = '\x1b';
 const SAVE = `${ESC}7`;
@@ -339,11 +339,23 @@ export class StatusBar {
 
     if (s.note) add(`│ ${s.note} `, `${color.grey('│')} ${color.yellow(s.note)} `);
 
+    // Measure what is PRINTED, not the plain-text label.
+    //
+    // This budgeted against `seg.plain` — a text-only twin of each segment —
+    // while emitting `seg.painted`, which also carries the 8- and 6-cell meter
+    // bars. That is 11 columns per segment unaccounted for, so the line ran
+    // roughly 55 columns over on a full bar and WRAPPED. A wrap on the last row
+    // scrolls the whole screen, which is what put a doubled status bar in the
+    // middle of the transcript and printed "bye" on top of the banner.
+    //
+    // displayWidth ignores escape sequences and counts wide glyphs as two, so
+    // it measures the thing the terminal actually lays out.
     let used = 0;
     const out: string[] = [];
     for (const seg of segments) {
-      if (used + seg.plain.length > budget) break;
-      used += seg.plain.length;
+      const w = displayWidth(seg.painted);
+      if (used + w > budget) break;
+      used += w;
       out.push(seg.painted);
     }
     return out.join('');
