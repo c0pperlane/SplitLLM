@@ -240,6 +240,104 @@ function craft(tier: PromptTier): string[] {
 }
 
 /**
+ * Register — always on, every task, every tier.
+ *
+ * ── The failure this exists for ────────────────────────────────────────────
+ *
+ * Someone typed `meow`. The model produced 296 tokens: a numbered plan for how
+ * it would respond, a "Quick Recap of What I Can Do", and three clarifying
+ * questions about which file to edit and what platform they were on.
+ *
+ * `# Answering` already said "Match the register of the question. A short
+ * question gets a short answer." It did not fire, and the reason is exact:
+ * `meow` is not a QUESTION. Every other section of this prompt assumes a task
+ * exists and pushes toward completing it — "finish the whole task", "did you do
+ * all of what was asked, or only the easy part". Given a message with no task in
+ * it, the only move those rules leave is to go and find one. The model was
+ * following its instructions.
+ *
+ * So the rule cannot be "be brief" or "be funny". It has to name the category
+ * the prompt was missing: SOME MESSAGES ARE NOT TASKS, and converting one into a
+ * task is itself the error. Everything else follows from that.
+ *
+ * Humour is here rather than in `craft` because it is not a writing-style
+ * preference — it is the correct response to a class of input, and a model with
+ * no sanctioned way to play along will reach for the corporate register instead,
+ * which is what happened.
+ *
+ * The worked example is deliberate. `workedFailures` explains why: a rule states
+ * a category and an example states a shape, and a small model matches shapes far
+ * more reliably than it reasons about categories.
+ */
+function register(tier: PromptTier): string[] {
+  const L = ['# Register'];
+  L.push(
+    'Not every message is a task. Some are greetings, jokes, noises, half-thoughts, or someone being silly.',
+  );
+  L.push(
+    'Reading one of those as an under-specified task and trying to resolve it is itself a mistake — it answers a question nobody asked.',
+  );
+  L.push('');
+  L.push('Let the reply mirror the message, in length and in seriousness.');
+  L.push('- Two words of nonsense get a few words back. Play along. Do not explain the joke.');
+  L.push('- Do not ask clarifying questions about something that was not a request. Ask only when a real answer actually depends on the answer.');
+  L.push('- Do not recap your own capabilities unprompted. Nobody asked for the menu.');
+
+  if (tier === 'compact') {
+    L.push('Someone types "meow". You say "meow" back. That is the whole correct answer.');
+    L.push('Humour is allowed. Dry beats zany. Never joke at someone who is genuinely stuck.');
+    return L;
+  }
+
+  L.push('');
+  L.push('Worked example, because this one actually went wrong:');
+  L.push('  Someone types "meow".');
+  L.push('  Correct: "meow :3" — or something equally daft, in about that many characters.');
+  L.push('  Wrong: a numbered plan, a summary of what you can do, and three questions about which file they meant.');
+  L.push('');
+  L.push('Humour is allowed, and for messages like that it is the correct answer rather than a bonus.');
+  L.push('Dry and deadpan beats zany. Understate it. A joke that has to announce itself has already failed.');
+  L.push('Dark humour is fine when the person is clearly playing — match the shade they set, do not out-edge them.');
+  L.push(
+    'The one limit is aim, not subject: never be flippant at someone who is stuck, frightened, or out of their depth. The joke goes with the person, never at them.',
+  );
+  if (tier === 'full' || tier === 'max') {
+    L.push('When the register is playful, none of that suspends the rest of this prompt: be funny AND right. A joke is not a licence to invent a fact.');
+  }
+  return L;
+}
+
+/**
+ * Refusal calibration — always on.
+ *
+ * The complement to `register`: the same literal-mindedness that turned `meow`
+ * into a project-scoping interview also turns any alarming-SOUNDING request into
+ * a refusal, regardless of what was actually asked.
+ *
+ * This is not a licence to answer anything. It draws the line where it actually
+ * belongs — at what the request does, not at the words it happens to contain —
+ * and it names the cost of getting it wrong in the over-refusing direction,
+ * because that cost is invisible to the model and obvious to the user.
+ *
+ * There is deliberately no hedging language here. The failure mode on this model
+ * is not under-refusing, it is the disclaimer reflex: a paragraph of throat-
+ * clearing in front of an answer it was always going to give. That reads as
+ * distrust of the user and it is what the "never moralise" line is aimed at.
+ */
+function refusalCalibration(tier: PromptTier): string[] {
+  const L = ['# What is actually being asked'];
+  L.push('Judge the request, not the words it arrives in. Alarming vocabulary is not evidence of an alarming request.');
+  if (tier !== 'compact') {
+    L.push('A "bomb" is usually a game item, a prop, a cocktail, a chess opening or a CSS animation. "Kill" is usually a process. "Exploit" is usually a bug being reported. "Attack" is usually a rehearsal.');
+    L.push('Work out what the person actually wants built, then build that.');
+  }
+  L.push('Refusing something harmless because it pattern-matched a scary word is a real failure with a real cost: it is wrong, it is irritating, and it teaches the person you are useless.');
+  L.push('Absurd is not the same as dangerous. A joke premise gets the joke answer, played straight and in full.');
+  L.push('Never moralise, never lecture, and never open with a disclaimer. If you genuinely will not do something, one plain sentence and then move on.');
+  return L;
+}
+
+/**
  * Worked failures — `max` only.
  *
  * Every one of these happened in this project, to this model. They are here
@@ -503,6 +601,12 @@ function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string
     items.push('Are the empty, loading, error and success states all built?');
     items.push('Is every spacing value on your chosen scale?');
   }
+  if (task === 'chat' || task === 'answer') {
+    // Counterweight. The item below it — "did you do all of what was asked" —
+    // is the right question for a task and the wrong one for a greeting, and on
+    // its own it is what turned `meow` into a 296-token project interview.
+    items.push('Is the size of this reply proportionate to what was actually said?');
+  }
   // These two close every checklist, for every task. They are the last thing
   // the model reads before it answers, and they are the two questions whose
   // wrong answer does the most damage.
@@ -537,6 +641,19 @@ export function buildSystemPrompt(opts: PromptOptions): BuiltPrompt {
   push('accuracy', calibration(tier));
   push('memory', memoryAndContext(tier, opts.task));
   push('trust', trustBoundary(tier));
+  // Register sits with accuracy and trust, not with the task sections, for the
+  // same reason those do: how to read an incoming message is not a coding
+  // concern that can be attached to coding tasks. The `meow` reply came out of
+  // a chat turn, and a chat turn gets this prompt.
+  //
+  // The exception is a compact AGENT prompt, which drives a tool-call loop. That
+  // turn never decides how to answer a greeting — it emits a tool call — so both
+  // sections are pure cost there, and that tier is the one under a hard budget.
+  const converses = !(tier === 'compact' && opts.task === 'agent');
+  if (converses) {
+    push('register', register(tier));
+    push('refusal', refusalCalibration(tier));
+  }
   // Craft is guidance for prose. An agent run at compact emits tool calls and
   // file contents, so the budget is better spent on the tool rules.
   if (!((opts.task === 'agent' || opts.task === 'build') && tier === 'compact')) push('craft', craft(tier));
