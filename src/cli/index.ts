@@ -38,6 +38,7 @@ import { Browser } from '../design/cdp.ts';
 import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
+import { PROMPT, attachPalette, paletteCompleter } from './prompt-ui.ts';
 import { buildSystemPrompt, describePrompt, tierForModel, type PromptTier } from '../prompt/system.ts';
 import { detectMedium } from '../prompt/principles.ts';
 import { UsageLedger, renderUsage } from './usage.ts';
@@ -205,7 +206,12 @@ async function main(): Promise<void> {
   );
   console.log(color.dim('  type /help for commands, or just ask a question\n'));
 
-  const rl = createInterface({ input: stdin, output: stdout, historySize: 200 });
+  const rl = createInterface({
+    input: stdin,
+    output: stdout,
+    historySize: 200,
+    completer: paletteCompleter,
+  });
   const lines = new LineReader(rl);
   const bar = new StatusBar();
   const ctx: Ctx = {
@@ -213,6 +219,7 @@ async function main(): Promise<void> {
     interrupt: { current: undefined },
   };
   bar.attach();
+  const detachPalette = attachPalette(rl, bar);
   syncBar(ctx);
 
   // One ^C, two meanings: during a request it aborts the request; at the
@@ -226,11 +233,18 @@ async function main(): Promise<void> {
 
   for (;;) {
     let line: string;
+    // Queued input (a paste, a piped script) is echoed by the LineReader itself
+    // as it drains, so the pinned row is skipped for those: pinning it would
+    // put the echo on a row that never scrolls into the transcript.
+    const pinned = bar.pinned && lines.pending === 0;
     try {
-      const got = await lines.next(color.cyan('› '));
+      if (pinned) bar.beginPrompt();
+      const got = await lines.next(PROMPT);
+      if (pinned) bar.endPrompt(PROMPT, got ?? '');
       if (got === undefined) break; // end of input / Ctrl-D
       line = got.trim();
     } catch {
+      if (pinned) bar.endPrompt(PROMPT, '');
       break; // Ctrl-C / Ctrl-D
     }
     if (!line) continue;
@@ -242,6 +256,7 @@ async function main(): Promise<void> {
     await handleQuery(line, ctx);
   }
 
+  detachPalette();
   bar.detach();
   rl.close();
   db.close();

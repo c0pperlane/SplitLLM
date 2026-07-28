@@ -1,12 +1,33 @@
 /**
- * A status line pinned under the input, that survives scrolling and resizing.
+ * The bottom chrome: command palette, prompt row, and status line.
  *
- * The mechanism is the terminal's scroll region (DECSTBM). Setting it to rows
- * 1..H-1 means everything the app prints scrolls within that area and never
- * touches the last row, so the bar can be painted there once and stay. The
- * alternative — reprinting a bar after every write — flickers, fights readline's
- * own redraw on each keystroke, and leaves debris whenever output is written
- * from a callback.
+ * ── Layout ────────────────────────────────────────────────────────────────
+ *
+ *     rows 1 … H-2-P   the conversation, scrolling (DECSTBM region)
+ *     rows H-1-P … H-2  the command palette, P rows, only while it is open
+ *     row  H-1          the prompt — a FIXED row, not the bottom of the flow
+ *     row  H            the status line
+ *
+ * The mechanism is the terminal's scroll region (DECSTBM). Confining everything
+ * the app prints to rows 1..H-2-P means output can never touch the rows below,
+ * so they can be painted once and stay. The alternative — reprinting after every
+ * write — flickers, fights readline's own redraw on each keystroke, and leaves
+ * debris whenever output is written from a callback.
+ *
+ * ── Why the prompt row is pinned, and what that costs ─────────────────────
+ *
+ * The palette has to sit ABOVE the prompt. A prompt that simply flows at the
+ * bottom of the conversation has nothing above it to draw into, so the prompt
+ * row has to be reserved too, and readline has to be placed on it explicitly.
+ *
+ * The cost is that a submitted line no longer scrolls into the transcript by
+ * itself: it was echoed onto a reserved row, and reserved rows do not scroll.
+ * `endPrompt` therefore re-echoes it into the region, which is why it takes the
+ * prompt text and the line back.
+ *
+ * That in turn needs the cursor position that output left off at, held across
+ * the whole prompt in DECSC. There is only ONE DECSC slot in a terminal, so
+ * while a prompt is live the status repaint must not use it — see `paint`.
  *
  * THE HAZARD, and why the teardown is so defensive: a scroll region survives
  * the process that set it. Exiting without resetting it leaves the user's shell
@@ -23,6 +44,7 @@ import { color } from './debug.ts';
 import { fmtCount } from './status.ts';
 import { coreCount } from '../config/settings.ts';
 import { cpuBusyFraction } from './cpu.ts';
+import { fitWidth } from './screen.ts';
 
 const ESC = '\x1b';
 const SAVE = `${ESC}7`;
@@ -50,11 +72,22 @@ export class StatusBar {
   private attached = false;
   private paused = false;
   private timer?: NodeJS.Timeout;
+
+  /** Palette rows currently displayed, top to bottom. */
+  private palette: string[] = [];
+  /** Rows the palette occupied last paint, so vacated rows get cleared. */
+  private paletteBand = 0;
+  /** True between beginPrompt and endPrompt: DECSC is in use, cursor is known. */
+  private prompting = false;
+  /** Column the prompt cursor sits at, 1-based, while prompting. */
+  private promptCol = 1;
+
   private readonly onResize = (): void => {
-    // A resize invalidates the scroll region: the reserved row is computed from
-    // the old height and would otherwise sit in the middle of the new window.
+    // A resize invalidates the scroll region: the reserved rows are computed
+    // from the old height and would otherwise sit in the middle of the window.
     if (!this.attached || this.paused) return;
     this.setRegion();
+    this.paintPalette();
     this.paint();
   };
 
@@ -87,8 +120,10 @@ export class StatusBar {
   pause(): void {
     if (!this.enabled || !this.attached || this.paused) return;
     this.paused = true;
-    stdout.write(`${ESC}[r`);
+    this.palette = [];
     this.clearRow();
+    this.prompting = false; // the panel owns the cursor now; DECSC is released
+    stdout.write(`${ESC}[r`);
   }
 
   resume(): void {
@@ -106,31 +141,155 @@ export class StatusBar {
   detach(): void {
     if (!this.enabled || !this.attached) return;
     this.attached = false;
+    this.prompting = false;
+    this.palette = [];
     if (this.timer) clearInterval(this.timer);
     stdout.removeListener('resize', this.onResize);
-    stdout.write(`${ESC}[r`); // restore the full window
     this.clearRow();
+    stdout.write(`${ESC}[r`); // restore the full window
+  }
+
+  // ── The reserved zone ───────────────────────────────────────────────────
+
+  /** True when the pinned prompt row is in use (TTY only). */
+  get pinned(): boolean {
+    return this.enabled && this.attached && !this.paused;
+  }
+
+  /** How many rows the palette may use, leaving the conversation room to breathe. */
+  paletteCapacity(): number {
+    return Math.max(0, Math.min(9, this.rows() - 8));
+  }
+
+  /**
+   * Replace the palette. Passing an empty list closes it and returns the rows
+   * to the conversation.
+   *
+   * `cursorCol` is where readline's cursor sits on the prompt row; the palette
+   * paint has to put it back, because it cannot use DECSC — `beginPrompt` is
+   * holding the only slot.
+   */
+  setPalette(lines: readonly string[], cursorCol: number): void {
+    if (!this.enabled || !this.attached || this.paused) return;
+    this.promptCol = Math.max(1, cursorCol);
+    const changed = lines.length !== this.palette.length;
+    this.palette = [...lines];
+    // Growing the palette takes rows away from the scroll region; the region
+    // must shrink BEFORE they are painted, or the next line of output scrolls
+    // straight through the list.
+    if (changed) this.setRegion();
+    this.paintPalette();
+  }
+
+  /** Park the cursor on the prompt row and hold the output position in DECSC. */
+  beginPrompt(): void {
+    if (!this.pinned) return;
+    this.prompting = true;
+    stdout.write(`${SAVE}${ESC}[${this.promptRow()};1H${ESC}[2K`);
+  }
+
+  /**
+   * Close the prompt: drop the palette, put the submitted line into the
+   * transcript, and return the cursor to where output left off.
+   *
+   * The echo is not cosmetic. The line was typed onto a reserved row, and
+   * reserved rows never scroll — without this, your own input vanishes from the
+   * history the moment the next prompt paints over it.
+   */
+  endPrompt(prompt: string, line: string): void {
+    if (!this.pinned || !this.prompting) return;
+    // `prompting` stays true through the clear and the region reset, so neither
+    // touches DECSC — the saved output position is consumed exactly once, by
+    // the RESTORE below.
+    let out = `${ESC}[${this.promptRow()};1H${ESC}[2K`;
+    for (let i = 0; i < this.paletteBand; i++) {
+      out += `${ESC}[${this.promptRow() - this.paletteBand + i};1H${ESC}[2K`;
+    }
+    this.paletteBand = 0;
+    this.palette = [];
+    stdout.write(out);
+    this.setRegion(); // give the palette rows back to the conversation
+    this.prompting = false;
+    stdout.write(`${RESTORE}${prompt}${line}\n`);
   }
 
   private rows(): number {
     return stdout.rows && stdout.rows > 3 ? stdout.rows : 24;
   }
 
-  private setRegion(): void {
-    // Reserve the last row, then park the cursor inside the region so the next
-    // write does not land on the reserved line.
-    stdout.write(`${SAVE}${ESC}[1;${this.rows() - 1}r${RESTORE}`);
+  private cols(): number {
+    return stdout.columns && stdout.columns > 20 ? stdout.columns : 80;
   }
 
+  /** The pinned prompt row: one above the status line. */
+  private promptRow(): number {
+    return this.rows() - 1;
+  }
+
+  private setRegion(): void {
+    // Reserve status + prompt + palette, then park the cursor inside the region
+    // so the next write does not land on a reserved line.
+    // DECSTBM homes the cursor, so the position has to be preserved around it.
+    const bottom = Math.max(1, this.rows() - 2 - this.palette.length);
+    stdout.write(`${this.guardOpen()}${ESC}[1;${bottom}r${this.guardClose()}`);
+  }
+
+  /** Wipe every reserved row — for teardown and for handing over the window. */
   private clearRow(): void {
-    stdout.write(`${SAVE}${ESC}[${this.rows()};1H${ESC}[2K${RESTORE}`);
+    let out = this.guardOpen();
+    for (let r = this.promptRow() - this.paletteBand; r <= this.rows(); r++) {
+      if (r >= 1) out += `${ESC}[${r};1H${ESC}[2K`;
+    }
+    this.paletteBand = 0;
+    stdout.write(out + this.guardClose());
+  }
+
+  private paintPalette(): void {
+    if (!this.enabled || !this.attached || this.paused) return;
+    const width = this.cols() - 1;
+    const P = this.palette.length;
+    const band = Math.max(P, this.paletteBand);
+    const base = this.promptRow() - band;
+
+    let out = this.guardOpen();
+    // Clear the union of the old and new bands, so shrinking the list does not
+    // leave the tail of the previous one stranded in the conversation area.
+    for (let i = 0; i < band; i++) {
+      const row = base + i;
+      if (row >= 1) out += `${ESC}[${row};1H${ESC}[2K`;
+    }
+    for (let i = 0; i < P; i++) {
+      const row = this.promptRow() - P + i;
+      if (row >= 1) out += `${ESC}[${row};1H${fitWidth(this.palette[i] ?? '', width)}`;
+    }
+    this.paletteBand = P;
+    stdout.write(out + this.guardClose());
   }
 
   private paint(): void {
     if (!this.enabled || !this.attached || this.paused) return;
-    const width = stdout.columns && stdout.columns > 20 ? stdout.columns : 80;
-    const line = this.compose(width);
-    stdout.write(`${SAVE}${ESC}[${this.rows()};1H${ESC}[2K${line}${RESTORE}`);
+    const line = this.compose(this.cols());
+    stdout.write(
+      `${this.guardOpen()}${ESC}[${this.rows()};1H${ESC}[2K${line}${this.guardClose()}`,
+    );
+  }
+
+  /**
+   * Bracket a write to a reserved row so the cursor ends where it started.
+   *
+   * While a prompt is live the position is known exactly (prompt row, readline's
+   * column), so it is restored by absolute move and DECSC is left untouched —
+   * `beginPrompt` is holding the terminal's single save slot for `endPrompt`,
+   * and a DECSC here would overwrite it with a status-bar coordinate. With no
+   * prompt live, output is mid-flight at a position only the terminal knows, so
+   * DECSC/DECRC is the only option, and it is free to use.
+   */
+  private guardOpen(): string {
+    return this.prompting ? '' : SAVE;
+  }
+
+  private guardClose(): string {
+    return this.prompting ? `${ESC}[${this.promptRow()};${this.promptCol}H` : RESTORE;
   }
 
   /**
