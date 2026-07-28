@@ -37,6 +37,23 @@ export function paletteCompleter(line: string): [string[], string] {
   return items.length === 0 ? [[], line] : [[completeTo(items[0]!)], line];
 }
 
+/**
+ * Listen for Ctrl+O anywhere, including mid-generation.
+ *
+ * Safe to add late, unlike the arrow keys the palette wanted: readline has no
+ * binding for Ctrl+O, so there is no handler that runs first and consumes it.
+ * Raw mode stays on for as long as the interface is open, which is why this
+ * still fires while the model is streaming and no prompt is pending.
+ */
+export function onCtrlO(fn: () => void): () => void {
+  if (!stdin.isTTY) return () => {};
+  const handler = (_s: string, key?: { name?: string; ctrl?: boolean }): void => {
+    if (key?.ctrl && key.name === 'o') fn();
+  };
+  stdin.on('keypress', handler);
+  return () => void stdin.off('keypress', handler);
+}
+
 /** Start redrawing the palette as the user types. Returns a detach function. */
 export function attachPalette(rl: Interface, bar: StatusBar): () => void {
   if (!stdin.isTTY) return () => {};

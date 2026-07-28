@@ -38,7 +38,8 @@ import { Browser } from '../design/cdp.ts';
 import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
-import { PROMPT, attachPalette, paletteCompleter } from './prompt-ui.ts';
+import { PROMPT, attachPalette, onCtrlO, paletteCompleter } from './prompt-ui.ts';
+import { ThinkingView } from './thinking.ts';
 import { buildSystemPrompt, describePrompt, tierForModel, type PromptTier } from '../prompt/system.ts';
 import { detectMedium } from '../prompt/principles.ts';
 import { UsageLedger, renderUsage } from './usage.ts';
@@ -118,6 +119,12 @@ interface Ctx {
    * at the prompt there is none and ^C leaves the REPL instead.
    */
   interrupt: { current: (() => void) | undefined };
+  /**
+   * The reasoning block Ctrl+O acts on. Held on the context rather than closed
+   * over, because the key can arrive between turns — when there is no block
+   * running and the last one is the thing worth replaying.
+   */
+  thinking: { current: ThinkingView | undefined };
 }
 
 /**
@@ -217,9 +224,13 @@ async function main(): Promise<void> {
   const ctx: Ctx = {
     rl, lines, db, session, provider, embedder, endpoints, bar,
     interrupt: { current: undefined },
+    thinking: { current: undefined },
   };
   bar.attach();
   const detachPalette = attachPalette(rl, bar);
+  // Ctrl+O expands the reasoning block — the live one while a request runs,
+  // otherwise the last one, which is usually when people want to look at it.
+  const detachCtrlO = onCtrlO(() => ctx.thinking.current?.toggle());
   syncBar(ctx);
 
   // One ^C, two meanings: during a request it aborts the request; at the
@@ -257,6 +268,7 @@ async function main(): Promise<void> {
   }
 
   detachPalette();
+  detachCtrlO();
   bar.detach();
   rl.close();
   db.close();
@@ -941,7 +953,9 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
     }).text;
 
     stdout.write('\n');
-    let thinkingShown = false;
+    // Collapsed by default; `/think show` starts it expanded, Ctrl+O flips it.
+    const think = new ThinkingView(session.showThinking);
+    ctx.thinking.current = think;
     // Live throughput in the bar. Counted from streamed chunks rather than from
     // the final usage figure, because the point is to see movement while it is
     // still generating — a silent terminal for 40 seconds is indistinguishable
@@ -957,20 +971,17 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
       maxTokens: getSettings().maxTokens,
       signal: controller.signal,
       onToken: (t) => {
+        // The first answer token is what actually ends the reasoning block —
+        // providers do not always signal it separately.
+        think.finish();
         stdout.write(t);
         streamed += 1;
         const secs = (Date.now() - genStart) / 1000;
         if (secs > 0.5) ctx.bar.set({ tps: streamed / secs, busy: true });
       },
-      onThinking: (t) => {
-        if (!session.showThinking) return;
-        if (!thinkingShown) {
-          stdout.write(color.grey('\n[thinking] '));
-          thinkingShown = true;
-        }
-        stdout.write(color.grey(t));
-      },
+      onThinking: (t) => think.push(t),
     });
+    think.finish(); // no answer tokens at all (empty reply, or thinking only)
     stdout.write('\n');
 
     session.turns += 1;
@@ -991,6 +1002,9 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
     const tps = rate > 0 ? ` @ ${rate.toFixed(1)} tok/s` : '';
     console.log(color.dim(`\n  ${gen.usage.inputTokens} in / ${gen.usage.outputTokens} out${tps}`));
   } catch (err) {
+    // A live reasoning line is unterminated — without this the abort notice is
+    // written over the top of "thinking — 4.2s" instead of below it.
+    ctx.thinking.current?.finish();
     if (controller.signal.aborted) {
       stdout.write('\n');
       console.log(color.yellow('  cancelled'));
