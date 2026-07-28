@@ -18,7 +18,8 @@
 import { stdin, stdout } from 'node:process';
 import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
-import { ESC, HIDE_CURSOR, KeyReader, SHOW_CURSOR, physicalRows, runMenu, type MenuItem } from './menu.ts';
+import { KeyReader, runMenu, type MenuItem } from './menu.ts';
+import { Screen, decodeKey } from './screen.ts';
 import { getCapabilities, listChatModels } from '../providers/capabilities.ts';
 import { SplitLlmProvider, type PullEvent } from '../providers/remote.ts';
 import { providerFor } from '../providers/factory.ts';
@@ -207,7 +208,8 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
   let failed = '';
   let cursor = 0;
   let version = 0;
-  let lastHeight = 0;
+  // Absolute repaint — see screen.ts for why predicted row counts drift.
+  const screen = new Screen();
   let picked: string | undefined;
   let debounce: NodeJS.Timeout | undefined;
 
@@ -240,10 +242,7 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
   };
 
   const draw = (): void => {
-    if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
-    const f = frame();
-    stdout.write(`${f}\n`);
-    lastHeight = physicalRows(f); // cursor ends N rows below the top, not N+1
+    screen.render(frame().split('\n'));
   };
 
   const searchSoon = (): void => {
@@ -282,25 +281,26 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
   stdin.resume();
   stdin.setEncoding('utf8');
   const reader = new KeyReader(stdin);
-  stdout.write(HIDE_CURSOR);
+  screen.enter({ mouse: false });
 
   try {
     draw();
     for (;;) {
-      const key = await reader.next();
-      if (key === ESC || key === '\x03') break;
+      const kk = decodeKey(await reader.next());
+      const key = kk.name === 'char' ? (kk.ch ?? '') : kk.name;
+      if (key === 'escape' || key === 'ctrl-c') break;
       if (key === '\r' || key === '\n') {
         const r = results[cursor];
         if (r) picked = hfPullRef(r.id);
         if (r) break;
         continue;
       }
-      if (key === `${ESC}[A`) {
+      if (key === 'up' || key === 'wheel-up') {
         cursor = Math.max(0, cursor - 1);
         draw();
         continue;
       }
-      if (key === `${ESC}[B`) {
+      if (key === 'down' || key === 'wheel-down') {
         cursor = Math.min(Math.max(0, results.length - 1), cursor + 1);
         draw();
         continue;
@@ -323,7 +323,7 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
   } finally {
     if (debounce) clearTimeout(debounce);
     reader.dispose();
-    stdout.write(SHOW_CURSOR);
+    screen.exit();
     try {
       stdin.setRawMode(wasRaw);
     } catch {
@@ -333,8 +333,8 @@ async function pickFromSearch(ctx: ModelBrowserCtx): Promise<string | undefined>
     ctx.rl.resume();
   }
 
-  // Erase the panel so the caller redraws its own UI cleanly beneath it.
-  if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
+  // The alternate screen restores whatever was underneath on exit, so there is
+  // nothing to erase by hand any more.
   return picked;
 }
 

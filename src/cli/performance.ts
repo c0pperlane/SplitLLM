@@ -24,7 +24,8 @@ import {
   type Settings,
 } from '../config/settings.ts';
 import { color } from './debug.ts';
-import { KeyReader, physicalRows } from './menu.ts';
+import { KeyReader } from './menu.ts';
+import { Screen, decodeKey } from './screen.ts';
 
 const ESC = '\x1b';
 
@@ -120,12 +121,14 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
   stdin.setEncoding('utf8');
   const reader = new KeyReader(stdin);
 
-  let lastHeight = 0;
+  // Absolute repaint. The old version moved the cursor up by a PREDICTED row
+  // count, which drifts the moment a line wraps or the window is resized — and
+  // the drift compounds, because each frame measures from where the last one
+  // left the cursor.
+  const screen = new Screen();
+  screen.enter({ mouse: false });
   const draw = (): void => {
-    if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
-    const frame = render(working, cursor, dirty);
-    stdout.write(frame + '\n');
-    lastHeight = physicalRows(frame); // cursor ends N rows below the top, not N+1
+    screen.render(render(working, cursor, dirty).split('\n'));
   };
 
   const adjust = (dir: 1 | -1): void => {
@@ -144,18 +147,19 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
   try {
     draw();
     for (;;) {
-      const key = await reader.next();
+      const k = decodeKey(await reader.next());
+      const key = k.name === 'char' ? (k.ch ?? '') : k.name;
       switch (key) {
-        case `${ESC}[A`: // up
+        case 'up':
           cursor = (cursor - 1 + specs.length) % specs.length;
           break;
-        case `${ESC}[B`: // down
+        case 'down':
           cursor = (cursor + 1) % specs.length;
           break;
-        case `${ESC}[C`: // right
+        case 'right':
           adjust(1);
           break;
-        case `${ESC}[D`: // left
+        case 'left':
           adjust(-1);
           break;
         case 'r':
@@ -163,14 +167,17 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
           working = defaultSettings();
           dirty = JSON.stringify(working) !== JSON.stringify(original);
           break;
-        case '\r':
-        case '\n':
+        case 'enter':
           saveSettings(working);
+          // Leave the alternate screen first, so the confirmation lands in the
+          // real scrollback instead of a buffer about to be discarded.
+          screen.exit();
           stdout.write(color.green('  performance settings applied\n'));
           return working;
-        case ESC:
+        case 'escape':
+        case 'ctrl-c':
         case 'q':
-        case '\x03': // Ctrl-C
+          screen.exit();
           stdout.write(color.grey('  cancelled — no changes\n'));
           return original;
         default:
@@ -180,6 +187,7 @@ export async function showPerformancePanel(rl: Interface): Promise<Settings> {
     }
   } finally {
     reader.dispose();
+    screen.exit(); // idempotent; covers the throw path too
     try {
       stdin.setRawMode(wasRaw);
     } catch {

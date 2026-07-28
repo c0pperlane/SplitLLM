@@ -27,10 +27,9 @@
 import { stdin, stdout } from 'node:process';
 import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
+import { Screen, decodeKey, viewport } from './screen.ts';
 
 const ESC = '\x1b';
-export const HIDE_CURSOR = `${ESC}[?25l`;
-export const SHOW_CURSOR = `${ESC}[?25h`;
 export { ESC };
 
 export interface MenuItem {
@@ -142,33 +141,36 @@ export class KeyReader {
 // Physical row accounting — the currency every redraw pays in.
 // ---------------------------------------------------------------------------
 
-const ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1bO[a-zA-Z]/g;
-
-export function visibleLength(s: string): number {
-  return s.replace(ANSI_RE, '').length;
-}
-
-/** Rows a string occupies when printed at the current window width. */
-export function physicalRows(s: string): number {
-  const cols = Math.max(20, stdout.columns || 80);
-  let rows = 0;
-  for (const line of s.split('\n')) rows += Math.max(1, Math.ceil(visibleLength(line) / cols));
-  return rows;
-}
-
 // ---------------------------------------------------------------------------
-// The frame
+// Layout: fixed chrome, scrolling body.
+//
+// The frame is built as an exact list of rows for the current window size, so
+// the renderer paints absolute positions and never has to guess how tall
+// anything turned out to be.
 // ---------------------------------------------------------------------------
 
-function frame(o: MenuOptions, cursor: number): string {
+/** Rows the chrome occupies: blank, title, subtitle, blank, hint, more, footer, rule. */
+const CHROME_ROWS = 8;
+
+function buildFrame(
+  o: MenuOptions,
+  cursor: number,
+  scrollTop: number,
+  screen: Screen,
+): { lines: string[]; top: number } {
+  const width = Math.min(screen.cols, 100) - 2;
   const L: string[] = [];
-  const width = Math.min(stdout.columns ?? 80, 78);
+
   L.push('');
-  L.push(color.bold(`  ── ${o.title} ${'─'.repeat(Math.max(0, width - o.title.length - 7))}`));
-  if (o.subtitle) L.push(color.dim(`  ${o.subtitle}`));
+  L.push(color.bold(`  ── ${o.title} ${'─'.repeat(Math.max(0, width - o.title.length - 5))}`));
+  L.push(o.subtitle ? color.dim(`  ${o.subtitle}`) : '');
   L.push('');
 
-  o.items.forEach((item, i) => {
+  const bodyRows = screen.viewportRows(CHROME_ROWS);
+  const { top } = viewport(o.items.length, cursor, bodyRows, scrollTop);
+
+  for (let i = top; i < Math.min(o.items.length, top + bodyRows); i++) {
+    const item = o.items[i]!;
     const active = i === cursor;
     const pointer = active ? color.cyan('▶ ') : '  ';
     const name = item.disabled
@@ -176,30 +178,26 @@ function frame(o: MenuOptions, cursor: number): string {
       : active
         ? color.bold(item.label.padEnd(26))
         : item.label.padEnd(26);
-    const value = item.value ? color.dim(item.value()) : '';
-    L.push(`  ${pointer}${name}${value}`);
-    if (active && item.hint) L.push(color.grey(`      ${item.hint}`));
-  });
-
-  L.push('');
-  L.push(color.grey(`  ${o.footer ?? '↑/↓ move   Enter open   Esc close'}`));
-  L.push(color.bold(`  ${'─'.repeat(width - 2)}`));
-  return L.join('\n');
-}
-
-/** Run `fn` while noting whether it wrote anything to stdout. */
-async function watched<T>(fn: () => Promise<T> | T): Promise<{ result: T; noisy: boolean }> {
-  const orig = stdout.write.bind(stdout);
-  let noisy = false;
-  (stdout as { write: typeof stdout.write }).write = ((chunk: unknown, ...rest: unknown[]) => {
-    noisy = true;
-    return (orig as (...a: unknown[]) => boolean)(chunk, ...rest);
-  }) as typeof stdout.write;
-  try {
-    return { result: await fn(), noisy };
-  } finally {
-    stdout.write = orig;
+    L.push(`  ${pointer}${name}${item.value ? color.dim(item.value()) : ''}`);
   }
+
+  // Pad the body to a constant height. Without this every row below the list
+  // shifts as the list length changes, which is what made the footer appear to
+  // jump around between redraws.
+  while (L.length < 4 + bodyRows) L.push('');
+
+  // The hint row is reserved whether or not there is a hint, for the same
+  // reason: a row that appears and disappears moves everything under it.
+  const hint = o.items[cursor]?.hint;
+  L.push(hint ? color.grey(`      ${hint}`) : '');
+  L.push(
+    o.items.length > bodyRows
+      ? color.dim(`  [${cursor + 1}/${o.items.length}]   PgUp/PgDn · Home/End · wheel`)
+      : '',
+  );
+  L.push(color.grey(`  ${o.footer ?? '↑/↓ move   Enter open   Esc close'}`));
+  L.push(color.bold(`  ${'─'.repeat(Math.max(10, width))}`));
+  return { lines: L, top };
 }
 
 /**
@@ -209,15 +207,18 @@ async function watched<T>(fn: () => Promise<T> | T): Promise<{ result: T; noisy:
  * something useful instead of hanging on keypresses that will never arrive.
  */
 export async function runMenu(o: MenuOptions): Promise<void> {
+  const screen = new Screen();
+
   if (!stdin.isTTY) {
-    stdout.write(`${frame(o, -1)}\n`);
+    o.refresh?.();
+    screen.render(buildFrame(o, -1, 0, screen).lines);
     stdout.write(color.grey('  (not a TTY — menus need an interactive terminal)\n'));
     return;
   }
 
   const firstEnabled = o.items.findIndex((i) => !i.disabled);
   let cursor = firstEnabled < 0 ? 0 : firstEnabled;
-  let lastHeight = 0;
+  let scrollTop = 0;
 
   o.rl?.pause();
   const wasRaw = stdin.isRaw ?? false;
@@ -225,77 +226,106 @@ export async function runMenu(o: MenuOptions): Promise<void> {
   stdin.resume();
   stdin.setEncoding('utf8');
   const reader = new KeyReader(stdin);
-  stdout.write(HIDE_CURSOR);
+  screen.enter();
 
-  const draw = (redrawInPlace: boolean): void => {
+  const draw = (): void => {
     o.refresh?.();
-    if (redrawInPlace && lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
-    const f = frame(o, cursor);
-    stdout.write(`${f}\n`);
-    // After printing an N-row frame plus its newline, the cursor sits exactly
-    // N rows below the frame's top — not N+1. Overshooting by one row per
-    // redraw makes the frame crawl upward into the scrollback above it.
-    lastHeight = physicalRows(f);
+    if (cursor >= o.items.length) cursor = Math.max(0, o.items.length - 1);
+    const { lines, top } = buildFrame(o, cursor, scrollTop, screen);
+    scrollTop = top;
+    screen.render(lines);
   };
 
-  const move = (dir: 1 | -1): void => {
-    // Skip disabled entries so the cursor cannot land somewhere Enter does
-    // nothing, which reads as the menu being broken.
-    for (let n = 0; n < o.items.length; n++) {
-      cursor = (cursor + dir + o.items.length) % o.items.length;
-      if (!o.items[cursor]?.disabled) return;
+  /** Move the selection, skipping disabled rows so Enter always does something. */
+  const move = (dir: 1 | -1, times = 1): void => {
+    for (let t = 0; t < times; t++) {
+      for (let n = 0; n < o.items.length; n++) {
+        cursor = (cursor + dir + o.items.length) % o.items.length;
+        if (!o.items[cursor]?.disabled) break;
+      }
     }
   };
 
-  /** Run an action; redraw in place when it printed nothing, append when it did. */
-  const act = async (fn: () => Promise<'stay' | 'close'> | 'stay' | 'close'): Promise<'stay' | 'close'> => {
+  /**
+   * Run an action on the REAL screen, not the alternate one.
+   *
+   * Actions print — probe results, prompts, confirmations — and that output
+   * belongs in the scrollback the user keeps, not on a buffer discarded at the
+   * next repaint. Leaving and re-entering costs one flicker and removes the
+   * whole class of "the action's output overlapped the frame" bugs, because
+   * the two never share a screen at all.
+   */
+  const act = async (
+    fn: () => Promise<'stay' | 'close'> | 'stay' | 'close',
+  ): Promise<'stay' | 'close'> => {
+    screen.exit();
     stdin.setRawMode(false);
-    stdout.write('\n');
-    let noisy = false;
     let verdict: 'stay' | 'close' = 'stay';
     try {
-      ({ result: verdict, noisy } = await watched(fn));
+      verdict = await fn();
     } finally {
       stdin.setRawMode(true);
       stdin.resume();
+      if (verdict === 'stay') screen.enter();
     }
-    if (noisy) {
-      lastHeight = 0; // the action printed; the new frame goes below its output
-    } else {
-      stdout.write(`${ESC}[1A${ESC}[0J`); // eat the separator newline we added
-    }
-    if (verdict === 'stay') draw(lastHeight > 0);
+    if (verdict === 'stay') draw();
     return verdict;
   };
 
   try {
-    draw(false);
+    draw();
     for (;;) {
-      const key = await reader.next();
+      const key = decodeKey(await reader.next());
+      const page = Math.max(1, screen.viewportRows(CHROME_ROWS) - 1);
 
-      if (key === `${ESC}[A` || key === `${ESC}OA`) move(-1);
-      else if (key === `${ESC}[B` || key === `${ESC}OB`) move(1);
-      else if (key === '\r' || key === '\n') {
-        const item = o.items[cursor];
-        if (item && !item.disabled) {
-          if ((await act(() => item.run())) === 'close') break;
+      switch (key.name) {
+        case 'up':
+        case 'wheel-up':
+          move(-1);
+          break;
+        case 'down':
+        case 'wheel-down':
+          move(1);
+          break;
+        case 'pageup':
+          move(-1, page);
+          break;
+        case 'pagedown':
+          move(1, page);
+          break;
+        case 'home':
+          cursor = Math.max(0, o.items.findIndex((i) => !i.disabled));
+          break;
+        case 'end':
+          cursor = o.items.length - 1;
+          if (o.items[cursor]?.disabled) move(-1);
+          break;
+        case 'enter': {
+          const item = o.items[cursor];
+          if (item && !item.disabled && (await act(() => item.run())) === 'close') return;
           continue;
         }
-        continue; // disabled row: nothing to run, nothing to redraw
-      } else if (key === ESC || key === 'q' || key === '\x03') {
-        break;
-      } else if (o.keys?.[key]) {
-        if ((await act(() => o.keys![key]!(cursor))) === 'close') break;
-        continue;
-      } else {
-        continue; // ignore without redrawing
+        case 'escape':
+        case 'ctrl-c':
+          return;
+        case 'char': {
+          const ch = key.ch ?? '';
+          if (ch === 'q') return;
+          if (o.keys?.[ch]) {
+            if ((await act(() => o.keys![ch]!(cursor))) === 'close') return;
+            continue;
+          }
+          continue; // unknown key: no redraw, no flicker
+        }
+        default:
+          continue; // mouse motion, unhandled button
       }
 
-      draw(lastHeight > 0);
+      draw();
     }
   } finally {
     reader.dispose();
-    stdout.write(SHOW_CURSOR);
+    screen.exit();
     try {
       stdin.setRawMode(wasRaw);
     } catch {

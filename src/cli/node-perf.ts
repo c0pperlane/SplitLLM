@@ -20,7 +20,8 @@
 import { stdin, stdout } from 'node:process';
 import type { Interface } from 'node:readline/promises';
 import { color } from './debug.ts';
-import { KeyReader, physicalRows } from './menu.ts';
+import { KeyReader } from './menu.ts';
+import { Screen, decodeKey } from './screen.ts';
 import { probeEndpoint } from '../providers/factory.ts';
 import {
   EndpointRegistry,
@@ -260,12 +261,14 @@ export async function showNodePerfPanel(
   stdin.setEncoding('utf8');
   const reader = new KeyReader(stdin);
 
-  let lastHeight = 0;
+  // Absolute-positioned repaint. The previous version moved the cursor up by a
+  // PREDICTED row count, which drifts the moment a line wraps or the window is
+  // resized — and the drift is cumulative, because the next frame measures from
+  // wherever the last one left the cursor.
+  const screen = new Screen();
+  screen.enter({ mouse: false });
   const draw = (): void => {
-    if (lastHeight > 0) stdout.write(`${ESC}[${lastHeight}A${ESC}[0J`);
-    const frame = render(ep, working, cursor, dirty, probeFailed);
-    stdout.write(`${frame}\n`);
-    lastHeight = physicalRows(frame); // cursor ends N rows below the top, not N+1
+    screen.render(render(ep, working, cursor, dirty, probeFailed).split('\n'));
   };
 
   const adjust = (dir: 1 | -1): void => {
@@ -293,18 +296,18 @@ export async function showNodePerfPanel(
   try {
     draw();
     for (;;) {
-      const key = await reader.next();
-      switch (key) {
-        case `${ESC}[A`:
+      const k = decodeKey(await reader.next());
+      switch (k.name === 'char' ? (k.ch ?? '') : k.name) {
+        case 'up':
           cursor = (cursor - 1 + specs.length) % specs.length;
           break;
-        case `${ESC}[B`:
+        case 'down':
           cursor = (cursor + 1) % specs.length;
           break;
-        case `${ESC}[C`:
+        case 'right':
           adjust(1);
           break;
-        case `${ESC}[D`:
+        case 'left':
           adjust(-1);
           break;
         case 'r':
@@ -312,8 +315,7 @@ export async function showNodePerfPanel(
           working = {};
           dirty = JSON.stringify(working) !== JSON.stringify(original);
           break;
-        case '\r':
-        case '\n': {
+        case 'enter': {
           // Drop AUTO entries entirely rather than persisting -1, so the
           // stored record says "unset" instead of encoding a sentinel that a
           // future reader would have to know about.
@@ -330,9 +332,9 @@ export async function showNodePerfPanel(
           stdout.write(color.green(`  ${ep.id}: node settings applied\n`));
           return clean;
         }
-        case ESC:
+        case 'escape':
+        case 'ctrl-c':
         case 'q':
-        case '\x03':
           stdout.write(color.grey('  cancelled — no changes\n'));
           return original;
         default:
@@ -342,6 +344,10 @@ export async function showNodePerfPanel(
     }
   } finally {
     reader.dispose();
+    // Leave the alternate screen BEFORE anything else prints, so the panel's
+    // closing message lands in the real scrollback rather than on a buffer the
+    // terminal is about to discard.
+    screen.exit();
     try {
       stdin.setRawMode(wasRaw);
     } catch {
