@@ -27,6 +27,7 @@ export const COMMANDS: readonly Command[] = [
   { name: 'endpoint', hint: 'model servers: add, test, switch, per-node CPU', alias: ['endpoints', 'server', 'node'] },
   { name: 'usage', hint: 'tokens: total, per node, context', alias: ['tokens', 'cost'] },
   { name: 'performance', hint: 'CPU, context, answer length for THIS machine', alias: ['perf', 'cpu', 'ram'] },
+  { name: 'continue', hint: 'resume an answer that hit the token limit', alias: ['resume', 'more'] },
   { name: 'debug', hint: 'the numbers behind the last routing decision', alias: ['trace'] },
   { name: 'why', hint: 'why a module was loaded — edges, weights, sources' },
   { name: 'learn', hint: 'force a search + scrape + graph update', alias: ['search'] },

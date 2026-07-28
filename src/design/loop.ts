@@ -18,6 +18,7 @@
  */
 
 import type { Page } from './cdp.ts';
+import { codeTemp } from '../config/settings.ts';
 import { verifyDesign, worstCategory, type Finding, type VerifyOptions, type VerifyResult } from './verify.ts';
 import { DEFAULT_TOKENS, composeDocument, tokenBrief, type DesignTokens } from './tokens.ts';
 import { parseLooseJson, type OllamaProvider } from '../providers/ollama.ts';
@@ -118,6 +119,7 @@ async function requestPage(
     messages: [{ role: 'user', content: user }],
     effort: 'medium',
     thinking: false,
+    temperature: codeTemp(),
     maxTokens: 2600,
     signal,
   });

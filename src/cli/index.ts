@@ -81,6 +81,12 @@ interface Session {
   thinking: boolean;
   showThinking: boolean;
   lastTrace?: RouteTrace;
+  /**
+   * The last answer that hit the token ceiling, kept so `/continue` can resume
+   * it. Cleared on any answer that finished normally, so `/continue` can never
+   * resume something two turns old.
+   */
+  lastAnswer?: { query: string; text: string };
   caps?: ModelCapabilities;
   tokensIn: number;
   tokensOut: number;
@@ -772,6 +778,22 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
       console.log(color.dim(`  ${describeSettings(getSettings())}`));
       return false;
 
+    case 'continue': {
+      const prev = session.lastAnswer;
+      if (!prev) {
+        console.log(color.grey('  nothing to continue — the last answer finished on its own'));
+        return false;
+      }
+      // Hand back the question and the partial answer, then ask for the rest.
+      // Re-asking the original question alone would restart from the top and
+      // burn the same budget reproducing what is already on screen.
+      await handleQuery(CONTINUE_MARKER, ctx, [
+        { role: 'user', content: prev.query },
+        { role: 'assistant', content: prev.text },
+      ]);
+      return false;
+    }
+
     case 'stats':
       console.log(
         `  modules: ${db.countModules()}  edges: ${db.countEdges()}  corpus: ${db.getCorpusDocs()} pages`,
@@ -812,7 +834,23 @@ async function runLearn(ctx: Ctx, topic: string, signal?: AbortSignal): Promise<
   );
 }
 
-async function handleQuery(query: string, ctx: Ctx): Promise<void> {
+/**
+ * The instruction `/continue` sends as its query.
+ *
+ * A marker rather than a literal, because it is used twice — as the request
+ * itself and as the thing routing must NOT be run against. Routing "carry on"
+ * retrieves nothing useful and costs a full retrieval pass; the prior turn
+ * already carries the context that mattered.
+ */
+const CONTINUE_MARKER =
+  'Continue the previous answer from exactly where it stopped. Do not repeat any of it, do not re-introduce it, and do not start over.';
+
+async function handleQuery(
+  query: string,
+  ctx: Ctx,
+  /** Prior turns to prepend. Only `/continue` supplies these. */
+  history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
+): Promise<void> {
   const { db, session, provider, embedder } = ctx;
 
   // Ctrl+C country. One controller covers routing, learning and generation —
@@ -835,7 +873,11 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
     for (const a of resolved.adjustments) console.log(color.yellow(`  ! ${a}`));
 
     const t0 = Date.now();
-    let result = await route(db, query, {
+    // Route on the ORIGINAL question, not on "carry on where you stopped" —
+    // that phrase retrieves nothing and would drop the context the first half
+    // of the answer was written against.
+    const rootQuery = history[0]?.content ?? query;
+    let result = await route(db, rootQuery, {
       effort: resolved.effort,
       baseThresholds: activeThresholds(),
       embedder,
@@ -965,7 +1007,7 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
     ctx.bar.set({ busy: true, tps: 0 });
     const gen = await provider.current.generate({
       system,
-      messages: [{ role: 'user', content: query }],
+      messages: [...history, { role: 'user', content: query }],
       effort: resolved.effort,
       thinking: resolved.thinking,
       maxTokens: getSettings().maxTokens,
@@ -1001,6 +1043,21 @@ async function handleQuery(query: string, ctx: Ctx): Promise<void> {
 
     const tps = rate > 0 ? ` @ ${rate.toFixed(1)} tok/s` : '';
     console.log(color.dim(`\n  ${gen.usage.inputTokens} in / ${gen.usage.outputTokens} out${tps}`));
+
+    // Truncation was previously invisible: Ollama has always reported it and
+    // nothing read the field, so a file cut off mid-function was indistinguishable
+    // from a finished one. Saying so is most of the value; /continue is the rest.
+    // Accumulate across repeated /continue, so a third one resumes from the
+    // whole answer rather than from the most recent fragment of it.
+    session.lastAnswer = gen.truncated
+      ? { query: rootQuery, text: (history[1]?.content ?? '') + gen.text }
+      : undefined;
+    if (gen.truncated) {
+      console.log(
+        color.yellow(`  ! cut off at the ${getSettings().maxTokens}-token limit`) +
+          color.grey('  — /continue to resume, or raise "Max answer length" in /settings'),
+      );
+    }
   } catch (err) {
     // A live reasoning line is unterminated — without this the abort notice is
     // written over the top of "thinking — 4.2s" instead of below it.
@@ -1029,6 +1086,7 @@ ${color.bold('  commands')}
     /models search <query>      search huggingface GGUF repos (s inside /models)
     /effort <low..max>          router breadth: seeds, hops, modules, pages
     /think <on|off|show>        toggle reasoning; 'show' displays it
+    /continue                   resume an answer that hit the token limit
     /design <brief>             generate a page, verify it, repair until it converges
     /site <brief>               build a full multi-section page, section by section
     /verify <file.html>         score an existing page against the design checks

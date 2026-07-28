@@ -19,6 +19,7 @@
  */
 
 import type { Page } from './cdp.ts';
+import { codeTemp } from '../config/settings.ts';
 import { verifyDesign, worstCategory, type Finding, type VerifyResult } from './verify.ts';
 import { DEFAULT_TOKENS, baseStylesheet, type DesignTokens } from './tokens.ts';
 import { ARCHETYPES, DEFAULT_PLAN, archetype, fillSkeleton, iconsFor, sharedSectionCss, type SectionArchetype } from './sections.ts';
@@ -168,6 +169,7 @@ async function fillSection(
     messages: [{ role: 'user', content: user }],
     effort: 'low',
     thinking: false,
+    temperature: codeTemp(),
     maxTokens: 700,
     signal,
   });

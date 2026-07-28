@@ -23,6 +23,11 @@ export interface GenerateOptions {
    *  capabilities.ts. `resolveRequest` reports any adjustment it had to make. */
   thinking: boolean;
   maxTokens?: number;
+  /**
+   * Sampling temperature, 0..1.5. Omitted means "use the configured default for
+   * conversation" — callers doing code or design work pass the lower one.
+   */
+  temperature?: number;
   /** Streaming callback for visible answer text. */
   onToken?: (chunk: string) => void;
   /** Streaming callback for reasoning summaries, when the provider exposes them. */
@@ -48,6 +53,14 @@ export interface GenerateResult {
   servedByFallback?: string;
   /** Local-provider throughput, for the CPU benchmark and /debug. */
   tokensPerSecond?: number;
+  /**
+   * True when generation stopped because it ran out of budget rather than
+   * because the model finished.
+   *
+   * Ollama has always reported this as `done_reason: "length"` and nothing read
+   * it, so a file cut off mid-function looked exactly like a complete one.
+   */
+  truncated?: boolean;
 }
 
 export interface Provider {

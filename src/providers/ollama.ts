@@ -86,6 +86,8 @@ interface OllamaChatResponse {
   eval_count?: number;
   eval_duration?: number;
   prompt_eval_duration?: number;
+  /** "stop" when the model finished, "length" when it ran out of budget. */
+  done_reason?: string;
   error?: string;
 }
 
@@ -259,6 +261,8 @@ export class OllamaProvider implements Provider {
         options: this.opts({
           num_ctx: this.ctx(),
           num_predict: this.answerTokens(opts.maxTokens),
+          temperature: opts.temperature ?? getSettings().temperature / 100,
+          repeat_penalty: getSettings().repeatPenalty / 100,
         }),
       }),
       signal: withTimeout(opts.signal),
@@ -273,6 +277,7 @@ export class OllamaProvider implements Provider {
     let promptTokens = 0;
     let evalTokens = 0;
     let evalDurationNs = 0;
+    let doneReason = '';
 
     for await (const chunk of readNdjson(res.body)) {
       const c = chunk as OllamaChatResponse;
@@ -292,6 +297,7 @@ export class OllamaProvider implements Provider {
         promptTokens = c.prompt_eval_count ?? 0;
         evalTokens = c.eval_count ?? 0;
         evalDurationNs = c.eval_duration ?? 0;
+        doneReason = c.done_reason ?? '';
       }
     }
 
@@ -304,6 +310,7 @@ export class OllamaProvider implements Provider {
         costUsd: 0,
       },
       model: this.model,
+      truncated: doneReason === 'length',
       ...(evalDurationNs > 0
         ? { tokensPerSecond: evalTokens / (evalDurationNs / 1e9) }
         : {}),

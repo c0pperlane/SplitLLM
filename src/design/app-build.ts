@@ -19,6 +19,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { Page } from './cdp.ts';
+import { codeTemp } from '../config/settings.ts';
 import { verifyDesign, type VerifyResult } from './verify.ts';
 import { baseStylesheet, CATPPUCCIN_TOKENS, type DesignTokens } from './tokens.ts';
 import { appCss, appTokensCss, type AppFile } from './app-shell.ts';
@@ -163,6 +164,7 @@ export async function generateContent(
     messages: [{ role: 'user', content: brief }],
     effort: 'medium',
     thinking: false,
+    temperature: codeTemp(),
     maxTokens: 1800,
     signal,
   });

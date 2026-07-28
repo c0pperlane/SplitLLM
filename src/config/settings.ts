@@ -78,6 +78,29 @@ export interface Settings {
   numCtx: number;
   /** Max tokens generated per answer. */
   maxTokens: number;
+  /**
+   * Sampling temperature for conversation, ×100 so it fits the integer sliders.
+   *
+   * Nothing set this before, so every request ran at Ollama's default of 0.8 —
+   * a chat temperature, applied to file generation as well.
+   */
+  temperature: number;
+  /**
+   * Sampling temperature for code and design work, ×100.
+   *
+   * Separate from the above because the right answer differs by roughly a
+   * factor of three, and one slider would have to be wrong for one of them.
+   * Invention — a plausible flag, a plausible API — is sampled from the tail,
+   * so the tail is what gets cut when the output has to compile.
+   */
+  codeTemperature: number;
+  /**
+   * Repetition penalty, ×100. 100 = off.
+   *
+   * The knob for a small model falling into a loop, which is the failure that
+   * makes an unbounded answer length dangerous rather than merely expensive.
+   */
+  repeatPenalty: number;
   /** How long Ollama keeps the model resident, in minutes. 0 = unload at once. */
   keepAliveMinutes: number;
   /** Max modules injected into a prompt. */
@@ -103,12 +126,39 @@ export function defaultSettings(): Settings {
     // block and a real conversation without the oldest turns sliding out.
     numCtx: 16384,
     maxTokens: 1200,
+    temperature: 70,
+    codeTemperature: 20,
+    repeatPenalty: 110,
     keepAliveMinutes: 30,
     maxModules: 12,
     maxPagesPerLearn: 6,
     lowPriority: true,
     promptTier: 0,
   };
+}
+
+/**
+ * Temperature for code, design and agent work, as Ollama wants it.
+ *
+ * A named helper rather than `getSettings().codeTemperature / 100` at each call
+ * site: the ×100 storage is a detail of the integer sliders, and repeating the
+ * division is how one call site ends up sending 20 instead of 0.20.
+ */
+/**
+ * Clamp to a range, falling back for a value that is not a usable number.
+ *
+ * A fractional value is rounded rather than rejected: `0.7` where 70 was meant
+ * rounds to 1, which is visibly wrong in the panel — better than 0.007 reaching
+ * the sampler, which is invisible and produces a model that only ever repeats
+ * its single most likely token.
+ */
+function clampInt(v: unknown, lo: number, hi: number, fallback: number): number {
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : fallback;
+  return Math.max(lo, Math.min(hi, n));
+}
+
+export function codeTemp(): number {
+  return getSettings().codeTemperature / 100;
 }
 
 /** Threads to hand Ollama, derived from the CPU budget. Always >= 1. */
@@ -177,11 +227,63 @@ export function settingSpecs(): SettingSpec[] {
       key: 'maxTokens',
       label: 'Max answer length',
       min: 200,
-      max: 4000,
+      // Raised from 4000: a full single-file page runs 2000-4000 tokens, so the
+      // old ceiling truncated exactly the output this project exists to make.
+      // Not unlimited, and deliberately so — `num_predict: -1` does not remove
+      // the real bound. That is `num_ctx`, and reaching it makes Ollama SHIFT
+      // the window rather than stop, so the model loses the top of the file it
+      // is writing and starts contradicting it. Unbounded degrading output is
+      // worse than a clean stop you can detect and continue from.
+      max: 16000,
       step: 200,
       unit: 'tok',
-      format: (v) => `${v} tokens  ≈ ${Math.round((v as number) / 15)}s at 15 tok/s`,
-      help: 'Caps generation length, and therefore how long an answer takes.',
+      format: (v) => {
+        const n = v as number;
+        const warn = n > getSettings().numCtx * 0.6 ? '  ! close to the context limit' : '';
+        return `${n} tokens  ≈ ${Math.round(n / 15)}s at 15 tok/s${warn}`;
+      },
+      help: 'Caps generation length. Truncated answers are reported, and /continue resumes them.',
+    },
+    {
+      key: 'temperature',
+      label: 'Answer temperature',
+      min: 0,
+      max: 150,
+      step: 5,
+      unit: '',
+      format: (v) => {
+        const t = (v as number) / 100;
+        const note = t <= 0.3 ? 'focused, repetitive' : t <= 0.9 ? 'balanced' : 'loose, inventive';
+        return `${t.toFixed(2)}  — ${note}`;
+      },
+      help: 'For conversation. Higher is more varied; lower repeats itself more.',
+    },
+    {
+      key: 'codeTemperature',
+      label: 'Code temperature',
+      min: 0,
+      max: 150,
+      step: 5,
+      unit: '',
+      format: (v) => {
+        const t = (v as number) / 100;
+        const note = t <= 0.3 ? 'recommended' : t <= 0.6 ? 'loose for code' : 'expect invented APIs';
+        return `${t.toFixed(2)}  — ${note}`;
+      },
+      help: 'For code, design and agent runs. Invented flags and APIs come from the sampling tail.',
+    },
+    {
+      key: 'repeatPenalty',
+      label: 'Repetition penalty',
+      min: 100,
+      max: 150,
+      step: 2,
+      unit: '',
+      format: (v) => {
+        const p = (v as number) / 100;
+        return p === 1 ? '1.00 — off' : `${p.toFixed(2)}${p >= 1.3 ? '  ! may distort code' : ''}`;
+      },
+      help: 'Stops a small model looping. Too high and it avoids legitimately repeated code.',
     },
     {
       key: 'keepAliveMinutes',
@@ -259,6 +361,13 @@ export function getSettings(): Settings {
     current = { ...defaultSettings(), ...raw };
     // Clamp anything a hand-edited file might have put out of range.
     current.cpuPercent = Math.max(100, Math.min(maxCpuPercent(), current.cpuPercent));
+    // The sampling values are stored ×100, so a file written by hand — or by
+    // someone reasonably assuming they are plain floats — can carry `0.7` where
+    // 70 is meant. Unclamped that reaches Ollama as temperature 0.007; the
+    // mirror-image slip sends 70. Both are silent, and both ruin every answer.
+    current.temperature = clampInt(current.temperature, 0, 150, 70);
+    current.codeTemperature = clampInt(current.codeTemperature, 0, 150, 20);
+    current.repeatPenalty = clampInt(current.repeatPenalty, 100, 150, 110);
   } catch {
     current = defaultSettings();
   }
