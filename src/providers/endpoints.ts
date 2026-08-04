@@ -24,7 +24,7 @@
  *    a generation, because the common failure is a typo'd port or a stale key.
  */
 
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 export type EndpointKind = 'ollama' | 'openai' | 'anthropic' | 'splitllm';
@@ -288,6 +288,26 @@ export function redact(key: string | undefined): string {
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
+/**
+ * What a brand-new install gets, so `/endpoint` has a row to select on day one
+ * and `/endpoint perf local` — not a laptop-only `/performance` slider that
+ * never learned about GPUs — is where Compute (auto/cpu/gpu) lives for it.
+ *
+ * `127.0.0.1` rather than `localhost`: Node's DNS resolution for `localhost`
+ * can prefer the IPv6 loopback, which fails outright against an Ollama that
+ * only bound the IPv4 socket — a "pull just hangs/fails" report with no
+ * obvious cause. The literal address has nothing to resolve.
+ */
+function defaultLocalEndpoint(): Endpoint {
+  return {
+    id: 'local',
+    kind: 'ollama',
+    baseUrl: (process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434').replace(/\/+$/, ''),
+    enabled: true,
+    note: 'built-in — this machine',
+  };
+}
+
 export class EndpointRegistry {
   private data: EndpointFile;
   private readonly path: string;
@@ -308,6 +328,27 @@ export class EndpointRegistry {
       // A missing or corrupt file means "no endpoints yet", never a crash on
       // startup — the local default still works without any of this.
     }
+  }
+
+  /**
+   * Give a genuinely fresh install a 'local' row to select and tune, instead
+   * of the implicit "no endpoints = built-in Ollama" state that leaves
+   * `/endpoint` empty and Compute (GPU vs CPU) with nowhere to live — that
+   * setting is per-endpoint (`perf.compute`), and local was never an
+   * endpoint.
+   *
+   * Only fires when the endpoints FILE has never existed. A file that exists
+   * but is empty means someone removed every endpoint on purpose (e.g.
+   * `/endpoint rm local`), and re-adding it behind their back would make
+   * removal not stick. Not run from the constructor: registries created for
+   * tests or ephemeral probing use paths that never had a file either, and
+   * would otherwise pick up an endpoint the caller never asked for.
+   */
+  seedLocalIfFirstRun(): void {
+    if (existsSync(this.path) || this.data.endpoints.length > 0) return;
+    const local = defaultLocalEndpoint();
+    this.data = { version: 1, active: local.id, endpoints: [local] };
+    this.save();
   }
 
   list(): Endpoint[] {

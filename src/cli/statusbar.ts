@@ -50,6 +50,19 @@ const ESC = '\x1b';
 const SAVE = `${ESC}7`;
 const RESTORE = `${ESC}8`;
 
+/**
+ * Target rows reserved for the prompt, on top of the one status row.
+ *
+ * readline knows nothing about the pinned-row layout — it wraps a long line
+ * using its own idea of a normal scrolling terminal. With only one row
+ * reserved, that wrap had nowhere to go but onto the status row directly
+ * below, which is what caused a long question (or a reply streaming in right
+ * as the window is short) to end up sharing a row with the status bar,
+ * each repaint overwriting the other. Fixed per prompt rather than regrown
+ * per keystroke — see `promptRows()`.
+ */
+const PROMPT_ROWS = 3;
+
 export interface BarState {
   endpoint: string;
   model: string;
@@ -61,6 +74,14 @@ export interface BarState {
   /** Set while a generation is running, so the bar can show live throughput. */
   busy: boolean;
   note?: string;
+  /**
+   * 'readonly' | 'ask' | 'auto' | 'yolo'. Shown always, not just in
+   * `/permissions` — readonly is the default, and a model that never got
+   * `write_file` in its tool list has no way to say so on its own; the
+   * confusion that produces (HTML pasted into chat instead of a file) is
+   * silent unless the mode itself is visible on every prompt.
+   */
+  permissions?: string;
 }
 
 export class StatusBar {
@@ -81,6 +102,14 @@ export class StatusBar {
   private prompting = false;
   /** Column the prompt cursor sits at, 1-based, while prompting. */
   private promptCol = 1;
+  /**
+   * Row the cursor sits on, 0-based, WITHIN the reserved prompt zone —
+   * needed because typed input can now wrap across more than one row.
+   * `guardClose()` needs both this and `promptCol` to put the cursor back
+   * where readline actually left it while a status repaint borrows the
+   * terminal's one save/restore slot.
+   */
+  private promptRowOffset = 0;
 
   private readonly onResize = (): void => {
     // A resize invalidates the scroll region: the reserved rows are computed
@@ -90,6 +119,8 @@ export class StatusBar {
     this.paintPalette();
     this.paint();
   };
+
+  private readonly bail = (): void => this.detach();
 
   constructor() {
     this.enabled = Boolean(stdout.isTTY) && !process.env.NO_COLOR && process.env.SPLITLLM_NO_STATUSBAR !== '1';
@@ -101,11 +132,10 @@ export class StatusBar {
     this.setRegion();
     stdout.on('resize', this.onResize);
 
-    const bail = (): void => this.detach();
-    process.once('exit', bail);
-    process.once('SIGINT', bail);
-    process.once('SIGTERM', bail);
-    process.once('uncaughtException', bail);
+    process.once('exit', this.bail);
+    process.once('SIGINT', this.bail);
+    process.once('SIGTERM', this.bail);
+    process.once('uncaughtException', this.bail);
 
     // Repaint on a timer so the CPU indicator and live tok/s move without the
     // caller having to drive them.
@@ -145,6 +175,10 @@ export class StatusBar {
     this.palette = [];
     if (this.timer) clearInterval(this.timer);
     stdout.removeListener('resize', this.onResize);
+    process.removeListener('exit', this.bail);
+    process.removeListener('SIGINT', this.bail);
+    process.removeListener('SIGTERM', this.bail);
+    process.removeListener('uncaughtException', this.bail);
     this.clearRow();
     // Resetting the scroll region HOMES THE CURSOR. Without saving around it,
     // everything printed after teardown starts at row 1 and lands on top of the
@@ -169,13 +203,16 @@ export class StatusBar {
    * Replace the palette. Passing an empty list closes it and returns the rows
    * to the conversation.
    *
-   * `cursorCol` is where readline's cursor sits on the prompt row; the palette
-   * paint has to put it back, because it cannot use DECSC — `beginPrompt` is
-   * holding the only slot.
+   * `cursorCol`/`cursorRowOffset` are where readline's cursor actually sits —
+   * a row offset because typed input can now wrap across more than one row
+   * of the reserved prompt zone. The palette paint has to put the cursor
+   * back afterwards, because it cannot use DECSC — `beginPrompt` is holding
+   * the only slot.
    */
-  setPalette(lines: readonly string[], cursorCol: number): void {
+  setPalette(lines: readonly string[], cursorCol: number, cursorRowOffset = 0): void {
     if (!this.enabled || !this.attached || this.paused) return;
     this.promptCol = Math.max(1, cursorCol);
+    this.promptRowOffset = Math.max(0, Math.min(PROMPT_ROWS - 1, cursorRowOffset));
     const changed = lines.length !== this.palette.length;
     this.palette = [...lines];
     // Growing the palette takes rows away from the scroll region; the region
@@ -185,34 +222,53 @@ export class StatusBar {
     this.paintPalette();
   }
 
-  /** Park the cursor on the prompt row and hold the output position in DECSC. */
+  /**
+   * Park the cursor at the top of the reserved prompt zone and hold the
+   * output position in DECSC.
+   *
+   * The zone is several rows tall, not one — a line that wraps past a single
+   * row needs somewhere real to go. Without this, the terminal's own
+   * auto-wrap pushes the cursor onto the status row below (row `rows()`),
+   * which can shift the whole screen by one line the moment that happens: the
+   * next thing printed then lands inside or past the status bar instead of
+   * in the conversation.
+   */
   beginPrompt(): void {
     if (!this.pinned) return;
     this.prompting = true;
-    stdout.write(`${SAVE}${ESC}[${this.promptRow()};1H${ESC}[2K`);
+    this.promptRowOffset = 0;
+    let out = SAVE;
+    for (let r = this.promptTop(); r <= this.promptRow(); r++) {
+      out += `${ESC}[${r};1H${ESC}[2K`;
+    }
+    out += `${ESC}[${this.promptTop()};1H`;
+    stdout.write(out);
   }
 
   /**
    * Close the prompt: drop the palette, put the submitted line into the
    * transcript, and return the cursor to where output left off.
    *
-   * The echo is not cosmetic. The line was typed onto a reserved row, and
-   * reserved rows never scroll — without this, your own input vanishes from the
-   * history the moment the next prompt paints over it.
+   * The echo is not cosmetic. The line was typed onto reserved rows, and
+   * reserved rows never scroll — without this, your own input vanishes from
+   * the history the moment the next prompt paints over it.
    */
   endPrompt(prompt: string, line: string): void {
     if (!this.pinned || !this.prompting) return;
     // `prompting` stays true through the clear and the region reset, so neither
     // touches DECSC — the saved output position is consumed exactly once, by
     // the RESTORE below.
-    let out = `${ESC}[${this.promptRow()};1H${ESC}[2K`;
+    let out = '';
+    for (let r = this.promptTop(); r <= this.promptRow(); r++) {
+      out += `${ESC}[${r};1H${ESC}[2K`;
+    }
     for (let i = 0; i < this.paletteBand; i++) {
-      out += `${ESC}[${this.promptRow() - this.paletteBand + i};1H${ESC}[2K`;
+      out += `${ESC}[${this.promptTop() - this.paletteBand + i};1H${ESC}[2K`;
     }
     this.paletteBand = 0;
     this.palette = [];
     stdout.write(out);
-    this.setRegion(); // give the palette rows back to the conversation
+    this.setRegion(); // give the palette and prompt rows back to the conversation
     this.prompting = false;
     stdout.write(`${RESTORE}${prompt}${line}\n`);
   }
@@ -225,23 +281,44 @@ export class StatusBar {
     return stdout.columns && stdout.columns > 20 ? stdout.columns : 80;
   }
 
-  /** The pinned prompt row: one above the status line. */
+  /** The pinned prompt row: the LAST row of the reserved prompt zone, one above the status line. */
   private promptRow(): number {
     return this.rows() - 1;
   }
 
+  /**
+   * The FIRST row of the reserved prompt zone. Input starts here and can
+   * wrap down as far as `promptRow()` before it would spill onto the status
+   * row — `promptRows()` rows of headroom, clamped to what the window can
+   * actually spare.
+   */
+  private promptTop(): number {
+    return this.promptRow() - (this.promptRows() - 1);
+  }
+
+  /**
+   * How many rows are set aside for the prompt, fixed for the terminal's
+   * current size (not regrown mid-line — resizing the reserved zone while
+   * readline is mid-keystroke would fight its own idea of where the cursor
+   * is). `PROMPT_ROWS` is the target; it shrinks on a short terminal so the
+   * conversation always keeps some room to breathe.
+   */
+  private promptRows(): number {
+    return Math.max(1, Math.min(PROMPT_ROWS, this.rows() - 6));
+  }
+
   private setRegion(): void {
-    // Reserve status + prompt + palette, then park the cursor inside the region
-    // so the next write does not land on a reserved line.
+    // Reserve status + prompt zone + palette, then park the cursor inside the
+    // region so the next write does not land on a reserved line.
     // DECSTBM homes the cursor, so the position has to be preserved around it.
-    const bottom = Math.max(1, this.rows() - 2 - this.palette.length);
+    const bottom = Math.max(1, this.rows() - 1 - this.promptRows() - this.palette.length);
     stdout.write(`${this.guardOpen()}${ESC}[1;${bottom}r${this.guardClose()}`);
   }
 
   /** Wipe every reserved row — for teardown and for handing over the window. */
   private clearRow(): void {
     let out = this.guardOpen();
-    for (let r = this.promptRow() - this.paletteBand; r <= this.rows(); r++) {
+    for (let r = this.promptTop() - this.paletteBand; r <= this.rows(); r++) {
       if (r >= 1) out += `${ESC}[${r};1H${ESC}[2K`;
     }
     this.paletteBand = 0;
@@ -253,7 +330,7 @@ export class StatusBar {
     const width = this.cols() - 1;
     const P = this.palette.length;
     const band = Math.max(P, this.paletteBand);
-    const base = this.promptRow() - band;
+    const base = this.promptTop() - band;
 
     let out = this.guardOpen();
     // Clear the union of the old and new bands, so shrinking the list does not
@@ -263,7 +340,7 @@ export class StatusBar {
       if (row >= 1) out += `${ESC}[${row};1H${ESC}[2K`;
     }
     for (let i = 0; i < P; i++) {
-      const row = this.promptRow() - P + i;
+      const row = this.promptTop() - P + i;
       if (row >= 1) out += `${ESC}[${row};1H${fitWidth(this.palette[i] ?? '', width)}`;
     }
     this.paletteBand = P;
@@ -293,7 +370,14 @@ export class StatusBar {
   }
 
   private guardClose(): string {
-    return this.prompting ? `${ESC}[${this.promptRow()};${this.promptCol}H` : RESTORE;
+    if (!this.prompting) return RESTORE;
+    // Row, not just column: input wrapping across the reserved zone means
+    // readline's cursor is not always on `promptRow()` — it can be anywhere
+    // from `promptTop()` down to it, and putting a status repaint's cursor
+    // back on the wrong row is exactly the "response and status bar overwrite
+    // each other" symptom this whole zone exists to prevent.
+    const row = Math.min(this.promptTop() + this.promptRowOffset, this.promptRow());
+    return `${ESC}[${row};${this.promptCol}H`;
   }
 
   /**
@@ -326,6 +410,16 @@ export class StatusBar {
 
     const ctxPlain = `ctx ${Math.round(ctxFrac * 100)}% ${fmtCount(s.contextUsed)}/${fmtCount(s.contextLimit)}`;
     add(` ${ctxPlain} `, ` ${color.dim('ctx')} ${mini(ctxFrac, 8, ctxPaint)} ${ctxPaint(`${String(Math.round(ctxFrac * 100)).padStart(3)}%`)} ${color.grey(`${fmtCount(s.contextUsed)}/${fmtCount(s.contextLimit)}`)} `);
+
+    if (s.permissions) {
+      // readonly is grey (nothing can happen without asking), yolo is red
+      // (nothing gets asked) — the same colour language as the CPU/context
+      // meters, so "am I in a mode that can write files" reads at a glance
+      // instead of requiring `/permissions` to check.
+      const permPaint =
+        s.permissions === 'yolo' ? color.red : s.permissions === 'auto' ? color.cyan : s.permissions === 'ask' ? color.yellow : color.grey;
+      add(`│ ${s.permissions} `, `${color.grey('│')} ${permPaint(s.permissions)} `);
+    }
 
     const cpuPlain = `cpu ${busyCores.toFixed(1)}/${cores}`;
     add(`│ ${cpuPlain} `, `${color.grey('│')} ${color.dim('cpu')} ${mini(busyCores / cores, 6, cpuPaint)} ${cpuPaint(`${busyCores.toFixed(1)}/${cores}`)} `);

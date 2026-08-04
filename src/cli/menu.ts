@@ -82,6 +82,22 @@ export class KeyReader {
     stream.on('data', this.onData);
   }
 
+  /**
+   * Detach from the stream without losing state — used while an action (e.g.
+   * a text prompt via readline) needs exclusive ownership of stdin. Left
+   * attached, this and readline's own listener both receive every byte, and
+   * whichever key opened the action can leak into the text the action then
+   * reads. `dispose()` is the permanent version, used when the menu closes.
+   */
+  detach(): void {
+    this.stream.removeListener('data', this.onData);
+    if (this.escTimer) clearTimeout(this.escTimer);
+  }
+
+  reattach(): void {
+    this.stream.on('data', this.onData);
+  }
+
   dispose(): void {
     this.stream.removeListener('data', this.onData);
     if (this.escTimer) clearTimeout(this.escTimer);
@@ -259,13 +275,22 @@ export async function runMenu(o: MenuOptions): Promise<void> {
     fn: () => Promise<'stay' | 'close'> | 'stay' | 'close',
   ): Promise<'stay' | 'close'> => {
     screen.exit();
+    // Give stdin to readline exclusively for the action's duration — a
+    // handler that prompts for text (via `ctx.ask`) needs readline's 'line'
+    // event, and leaving this reader attached alongside it means both
+    // receive every byte, letting the key that opened the action leak into
+    // whatever the action then reads as its first character.
+    reader.detach();
     stdin.setRawMode(false);
+    o.rl?.resume();
     let verdict: 'stay' | 'close' = 'stay';
     try {
       verdict = await fn();
     } finally {
+      o.rl?.pause();
       stdin.setRawMode(true);
       stdin.resume();
+      reader.reattach();
       if (verdict === 'stay') screen.enter();
     }
     if (verdict === 'stay') draw();

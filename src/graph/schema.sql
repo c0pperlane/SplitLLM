@@ -165,6 +165,35 @@ CREATE TABLE IF NOT EXISTS page_cache (
 CREATE INDEX IF NOT EXISTS idx_cache_fetched ON page_cache(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_cache_domain  ON page_cache(domain);
 
+-- FTS over cached page bodies, external-content so the HTML is not duplicated.
+-- Exists so `termDomainBreadth` (how many distinct hostnames mention a term —
+-- the signal that tells a real subject like "kubernetes" apart from glue like
+-- "connection") can be measured through the SAME porter-stemmed match the
+-- actual retrieval uses. It previously ran its own raw, unstemmed split
+-- instead, which silently disagreed with FTS5 about what a token even is:
+-- "whats" (rare unstemmed — real pages almost always spell it "what's") and
+-- "what" (ubiquitous, once stemmed) read as two different words to breadth,
+-- but as the same word to the search — casual, apostrophe-dropped typing is
+-- exactly what exposed the gap, routing "whats new in forza horizon" to
+-- whatever thin module happened to contain the word "what" anywhere.
+CREATE VIRTUAL TABLE IF NOT EXISTS page_fts USING fts5(
+  domain, body,
+  content       = 'page_cache',
+  content_rowid = 'rowid',
+  tokenize      = 'porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS page_cache_ai AFTER INSERT ON page_cache BEGIN
+  INSERT INTO page_fts(rowid, domain, body) VALUES (new.rowid, new.domain, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS page_cache_ad AFTER DELETE ON page_cache BEGIN
+  INSERT INTO page_fts(page_fts, rowid, domain, body) VALUES ('delete', old.rowid, old.domain, old.body);
+END;
+CREATE TRIGGER IF NOT EXISTS page_cache_au AFTER UPDATE ON page_cache BEGIN
+  INSERT INTO page_fts(page_fts, rowid, domain, body) VALUES ('delete', old.rowid, old.domain, old.body);
+  INSERT INTO page_fts(rowid, domain, body) VALUES (new.rowid, new.domain, new.body);
+END;
+
 -- ---------------------------------------------------------------------------
 -- Search result cache, keyed by normalised query.
 -- ---------------------------------------------------------------------------

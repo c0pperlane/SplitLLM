@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { scoreOf, worstCategory, verifyDesign, DEFAULT_VERIFY, type Finding } from '../src/design/verify.ts';
 import { DEFAULT_TOKENS, baseStylesheet, composeDocument, tokenBrief } from '../src/design/tokens.ts';
 import { findBrowser, Browser } from '../src/design/cdp.ts';
+import { scanJsxWithoutTranspiler } from '../src/design/runtime-verify.ts';
 
 function f(check: string, severity: Finding['severity']): Finding {
   return { check, severity, message: `${check} failed`, repair: `fix ${check}` };
@@ -139,4 +140,55 @@ test('THE VALIDITY GAP: invalid CSS and dead transitions are caught in a real br
   } finally {
     await browser.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// JSX that nothing transpiles.
+//
+// THE observed failure: a generated login page loaded React + ReactDOM from a
+// CDN, put its component in app.js full of JSX, and included no Babel. The
+// browser parses app.js as ordinary JavaScript, throws SyntaxError at the
+// first tag, and renders an empty #root — a blank page with no visible cause,
+// which every runtime probe reports as healthy because nothing ever ran.
+// ---------------------------------------------------------------------------
+
+test('JSX in an external plain script with no Babel is caught', () => {
+  const html =
+    '<!DOCTYPE html><html><body><div id="root"></div>' +
+    '<script src="https://unpkg.com/react@17/umd/react.development.js"></script>' +
+    '<script src="app.js"></script></body></html>';
+  const appJs = 'function App(){ return (<form onSubmit={x}><input /></form>); }';
+  const found = scanJsxWithoutTranspiler(html, [{ src: 'app.js', content: appJs }]);
+  assert.equal(found.length, 1, 'the real-world shape of this bug must be caught');
+  assert.equal(found[0]!.severity, 'error');
+  assert.match(found[0]!.message, /app\.js/);
+});
+
+test('JSX inline without type="text/babel" is caught', () => {
+  const html =
+    '<!DOCTYPE html><html><head>' +
+    '<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script></head>' +
+    '<body><script>ReactDOM.render(<App />, root);</script></body></html>';
+  const found = scanJsxWithoutTranspiler(html, []);
+  assert.equal(found.length, 1, 'Babel present does not help a block it never claims');
+});
+
+test('a correctly wired Babel page produces no findings', () => {
+  const html =
+    '<!DOCTYPE html><html><head>' +
+    '<script src="https://unpkg.com/react@18/umd/react.development.js"></script>' +
+    '<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script></head>' +
+    '<body><div id="root"></div><script type="text/babel">' +
+    'function App(){ return (<div className="x"><button>hi</button></div>); }' +
+    'ReactDOM.render(<App />, document.getElementById("root"));' +
+    '</script></body></html>';
+  assert.deepEqual(scanJsxWithoutTranspiler(html, []), []);
+});
+
+test('ordinary JavaScript comparisons are not mistaken for JSX', () => {
+  // `a < b` and `i<n` must never read as a tag, or every plain script in the
+  // project would be reported as broken.
+  const html = '<!DOCTYPE html><html><body><script src="a.js"></script></body></html>';
+  const plain = 'const a=1; if (a < b && c > d) { log(a<b); } for(let i=0;i<n;i++){}';
+  assert.deepEqual(scanJsxWithoutTranspiler(html, [{ src: 'a.js', content: plain }]), []);
 });

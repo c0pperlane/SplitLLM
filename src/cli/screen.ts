@@ -156,6 +156,10 @@ export class Screen {
     if (!this.active) return;
     this.active = false;
     stdout.removeListener('resize', this.onResize);
+    process.removeListener('exit', this.teardown);
+    process.removeListener('SIGINT', this.teardown);
+    process.removeListener('SIGTERM', this.teardown);
+    process.removeListener('uncaughtException', this.teardown);
     stdout.write((this.mouse ? MOUSE_OFF : '') + SHOW + ALT_OFF);
   }
 

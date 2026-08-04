@@ -62,18 +62,24 @@ export function attachPalette(rl: Interface, bar: StatusBar): () => void {
     if (!bar.pinned) return;
     const line = (rl as unknown as { line?: string }).line ?? '';
     const cursor = (rl as unknown as { cursor?: number }).cursor ?? line.length;
-    const col = displayWidth(PROMPT) + cursor + 1;
+    // Total offset from the start of the prompt text, which can now exceed
+    // one terminal row — the reserved prompt zone is several rows tall (see
+    // statusbar.ts), so the cursor's actual row and column both need it.
+    const width = Math.max(1, stdout.columns ?? 80);
+    const total = displayWidth(PROMPT) + cursor;
+    const rowOffset = Math.floor(total / width);
+    const col = (total % width) + 1;
 
     const capacity = bar.paletteCapacity();
     // Below a couple of rows there is no room for a list and its footer, and a
     // one-row palette is worse than none.
     if (!isPaletteQuery(line) || capacity < 3) {
-      bar.setPalette([], col);
+      bar.setPalette([], col, rowOffset);
       return;
     }
     // capacity - 1 leaves the footer row its space.
     const state = filterCommands(line, capacity - 1);
-    bar.setPalette(renderPalette(state, stdout.columns ?? 80, color), col);
+    bar.setPalette(renderPalette(state, stdout.columns ?? 80, color), col, rowOffset);
   };
 
   // Deferred by one tick: readline processes the key in its own handler, which

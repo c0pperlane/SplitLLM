@@ -145,24 +145,40 @@ export async function anySubject(
   return { yes: verdicts.some((v) => v.cls === 'subject'), verdicts };
 }
 
+/**
+ * dictionaryapi.dev serves several languages, not only English — hitting
+ * only `/en/` meant every German, French or Spanish word was invisible to
+ * this vote regardless of whether it was glue or a real subject. That
+ * mattered more than it looks: `judgeWord`'s "never seen before" signal
+ * (line ~117) only treats an unknown word as glue-protected when the
+ * dictionary EXPLICITLY says so; a dictionary that is blind to a whole
+ * language gives every function word in it a free pass to "unknown,
+ * therefore learn it" on first encounter — the exact false-trigger this
+ * judge exists to prevent, silently unprotected outside English. Tried in
+ * parallel, not sequentially, so a token existing in none of them still
+ * costs one timeout rather than four.
+ */
+const DICT_LANGS = ['en', 'de', 'fr', 'es'] as const;
+
 /** Live dictionary lookup with a permanent cache in the graph db. */
 export function dictionaryPosFetcher(db: GraphDb): PosFetcher {
   return async (token: string): Promise<string | undefined> => {
     const cached = db.getWordPos(token);
     if (cached !== undefined) return cached || undefined;
 
-    let pos = '';
-    try {
-      const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(token)}`, {
-        signal: AbortSignal.timeout(4000),
-      });
-      if (res.ok) {
+    const attempts = DICT_LANGS.map(async (lang) => {
+      try {
+        const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/${lang}/${encodeURIComponent(token)}`, {
+          signal: AbortSignal.timeout(4000),
+        });
+        if (!res.ok) return undefined;
         const body = (await res.json()) as Array<{ meanings?: Array<{ partOfSpeech?: string }> }>;
-        pos = body[0]?.meanings?.[0]?.partOfSpeech ?? '';
+        return body[0]?.meanings?.[0]?.partOfSpeech || undefined;
+      } catch {
+        return undefined; // offline, or this language's dictionary does not have it
       }
-    } catch {
-      /* offline: corpus stats stand alone */
-    }
+    });
+    const pos = (await Promise.all(attempts)).find((p) => p !== undefined) ?? '';
     db.setWordPos(token, pos);
     return pos || undefined;
   };

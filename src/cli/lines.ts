@@ -55,6 +55,20 @@ export class LineReader {
     }
     if (this.ended) return undefined;
 
+    // A menu (see menu.ts) reads raw keystrokes on the same stdin while it is
+    // open, one of which (the key that opened THIS prompt, e.g. 'p' for
+    // "pull by name") can land in readline's own in-progress line buffer
+    // before this prompt ever asked for input — readline keeps accumulating
+    // into it regardless of `rl.pause()`, since pause only stops the 'line'
+    // event, not byte capture. Left alone, that stray keystroke becomes the
+    // first character of whatever the user types next: 'p' + "owner/repo"
+    // silently became "powner/repo". Clearing it right before a genuinely
+    // fresh prompt is the only point that is safe to do so — the queued-line
+    // path above is untouched because that IS real user input, just early.
+    const rl = this.rl as unknown as { line?: string; cursor?: number };
+    rl.line = '';
+    rl.cursor = 0;
+
     stdout.write(prompt);
     return new Promise<string | undefined>((resolve) => {
       this.waiting = { resolve };

@@ -29,15 +29,19 @@ import { describeSettings, showPerformancePanel } from './performance.ts';
 import { coreCount, getSettings, threadsFor, tierSetting } from '../config/settings.ts';
 import { runDesignCommand, runSiteCommand, runVerifyCommand } from './design-cmd.ts';
 import { readFileSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
+import { homedir } from 'node:os';
 import { MODES, describeMode, canWrite, type PermissionMode } from './permissions.ts';
 import { checkCommand, runCommand, formatResult } from './shell.ts';
 import { LiveStatus, SessionMeter, contextBar, estimateTokens, fmtDuration } from './status.ts';
 import { Sandbox } from '../agent/tools.ts';
 import { runAgent } from '../agent/loop.ts';
-import { Browser } from '../design/cdp.ts';
+import type { AgentStep } from '../agent/loop.ts';
+import { Browser, findBrowser, type Page } from '../design/cdp.ts';
 import { LineReader } from './lines.ts';
 import { showNodePerfPanel } from './node-perf.ts';
 import { StatusBar } from './statusbar.ts';
+import { ensureLocalOllama } from './ollama-bootstrap.ts';
 import { PROMPT, attachPalette, onCtrlO, paletteCompleter } from './prompt-ui.ts';
 import { ThinkingView } from './thinking.ts';
 import { buildSystemPrompt, describePrompt, tierForModel, type PromptTier } from '../prompt/system.ts';
@@ -46,7 +50,7 @@ import { UsageLedger, renderUsage } from './usage.ts';
 import { runModelBrowser, printModelSearch } from './models.ts';
 import { runSettingsMenu, runEndpointsMenu, settingsShortcut, type SettingsCtx } from './settings-menu.ts';
 import type { Provider } from '../providers/types.ts';
-import { EndpointRegistry, KIND_DEFAULTS } from '../providers/endpoints.ts';
+import { EndpointRegistry, KIND_DEFAULTS, numGpuFor, threadsForNode } from '../providers/endpoints.ts';
 import { providerFor } from '../providers/factory.ts';
 import { SplitLlmProvider } from '../providers/remote.ts';
 import {
@@ -65,10 +69,59 @@ const AGENT_TOOL_NAMES = ['list_files', 'read_file', 'write_file', 'edit_file', 
 /** The subset that a read-only session can actually complete. */
 const READONLY_TOOL_NAMES = ['list_files', 'read_file', 'verify'];
 
+/**
+ * "This request expects a file at the end of it."
+ *
+ * Only used to decide whether to WARN that the current mode cannot write —
+ * never to gate capability, so a false positive costs one grey line and a
+ * false negative costs nothing that was not already broken. Deliberately
+ * verb-led and multilingual: the failure it explains (readonly silently
+ * producing no file) is just as confusing in German as in English.
+ */
+const BUILD_INTENT =
+  /\b(make|build|create|write|generate|design|implement|add|scaffold|set\s?up|mach|erstell|schreib|baue?|entwirf)\w*\b/i;
+
 /** Base thresholds with the user's performance settings folded in. */
 function activeThresholds(): typeof DEFAULT_THRESHOLDS {
   const s = getSettings();
   return { ...DEFAULT_THRESHOLDS, maxModules: s.maxModules, maxPagesPerLearn: s.maxPagesPerLearn };
+}
+
+/**
+ * Backstop against pointing the sandbox at something clearly too broad.
+ *
+ * `Sandbox`'s own DENY list still protects `.ssh`/`.env`/key files wherever
+ * the root ends up — this catches the coarser mistake it cannot: a root of
+ * `C:\` or `/etc` puts every OTHER file on the machine one `write_file` call
+ * away, which no per-path denylist entry can express. Same philosophy as the
+ * always-blocked shell commands in permissions.ts — a backstop, not the
+ * actual security boundary (the boundary is picking a sane folder).
+ */
+function guardFolderRoot(abs: string): string | undefined {
+  const norm = abs.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+  if (norm === '/' || /^[A-Za-z]:$/.test(norm)) {
+    return 'refusing to use a filesystem root — point it at a project folder underneath instead';
+  }
+  const dangerous = [
+    /^[A-Za-z]:\/Windows(\/|$)/i,
+    /^[A-Za-z]:\/Program Files(?: \(x86\))?(\/|$)/i,
+    /^[A-Za-z]:\/ProgramData(\/|$)/i,
+    /^\/etc(\/|$)/,
+    /^\/bin(\/|$)/,
+    /^\/sbin(\/|$)/,
+    /^\/usr(\/|$)/,
+    /^\/boot(\/|$)/,
+    /^\/System(\/|$)/,
+    /^\/Library(\/|$)/,
+  ];
+  if (dangerous.some((re) => re.test(norm))) {
+    return `refusing to use a system directory: ${abs}`;
+  }
+  const home = homedir().replace(/\\/g, '/').replace(/\/+$/, '');
+  if (norm === home) {
+    return 'refusing to use the home directory itself — pick a folder inside it, e.g. ~/projects/foo';
+  }
+  return undefined;
 }
 
 interface Session {
@@ -92,6 +145,17 @@ interface Session {
   tokensOut: number;
   turns: number;
   usage: UsageLedger;
+  /**
+   * Rolling short-term memory: the last few Q&A pairs, in order.
+   *
+   * Separate from `history` (the `/continue` mechanism, which resumes ONE
+   * truncated answer). This is what makes "wdym X?" resolvable when X was
+   * only ever mentioned in the previous answer — without it, every query was
+   * routed and answered as if the conversation had no prior turns, and a
+   * follow-up referencing the last answer looked exactly like a fresh,
+   * unrelated one to the router.
+   */
+  transcript: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
 /**
@@ -165,9 +229,11 @@ async function main(): Promise<void> {
     tokensOut: 0,
     turns: 0,
     usage: new UsageLedger(),
+    transcript: [],
   };
 
   const endpoints = new EndpointRegistry();
+  endpoints.seedLocalIfFirstRun();
   const activeEp = endpoints.active();
   const provider: { current: Provider } = {
     current: activeEp && activeEp.enabled !== false ? providerFor(activeEp) : new OllamaProvider(),
@@ -186,8 +252,23 @@ async function main(): Promise<void> {
 
   console.log(color.dim('  endpoint: ') + describeActive(endpoints, provider.current.model));
 
-  const health = await provider.current.available();
+  // Needed early: recovering an unreachable local Ollama means asking the
+  // user a yes/no question before the rest of startup can know the real
+  // health of the provider it is about to report on.
+  const rl = createInterface({
+    input: stdin,
+    output: stdout,
+    historySize: 200,
+    completer: paletteCompleter,
+  });
+  const lines = new LineReader(rl);
+
+  let health = await provider.current.available();
   const localProvider = asOllama(provider.current);
+  if (!health.ok && localProvider) {
+    const fixed = await ensureLocalOllama(localProvider.baseUrl, (p) => lines.next(p).then((v) => v ?? ''));
+    if (fixed) health = await provider.current.available();
+  }
   if (health.ok) {
     console.log(color.dim('  model: ') + color.green(provider.current.model));
     if (localProvider) {
@@ -219,13 +300,6 @@ async function main(): Promise<void> {
   );
   console.log(color.dim('  type /help for commands, or just ask a question\n'));
 
-  const rl = createInterface({
-    input: stdin,
-    output: stdout,
-    historySize: 200,
-    completer: paletteCompleter,
-  });
-  const lines = new LineReader(rl);
   const bar = new StatusBar();
   const ctx: Ctx = {
     rl, lines, db, session, provider, embedder, endpoints, bar,
@@ -318,6 +392,7 @@ function syncBar(ctx: Ctx, patch: Partial<import('./statusbar.ts').BarState> = {
     contextLimit: ep?.perf?.numCtx ?? getSettings().numCtx,
     tokensIn: ctx.session.tokensIn,
     tokensOut: ctx.session.tokensOut,
+    permissions: ctx.session.permissions,
     ...patch,
   });
 }
@@ -338,6 +413,7 @@ function settingsCtx(ctx: Ctx): SettingsCtx {
     getPermissions: () => ctx.session.permissions,
     setPermissions: (m) => {
       ctx.session.permissions = m;
+      syncBar(ctx);
     },
     pauseBar: () => ctx.bar.pause(),
     resumeBar: () => {
@@ -532,8 +608,16 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
           return false;
         }
         case 'local':
-          reg.setActive(undefined);
-          switchToEndpoint(ctx, undefined);
+          // Prefer the seeded 'local' endpoint so any Compute/perf tuning set
+          // via `/endpoint perf local` still applies; only fall back to the
+          // bare, perf-less provider if that entry was explicitly removed.
+          if (reg.get('local')) {
+            reg.setActive('local');
+            switchToEndpoint(ctx, 'local');
+          } else {
+            reg.setActive(undefined);
+            switchToEndpoint(ctx, undefined);
+          }
           return false;
         case 'use': {
           const [idPart, ...modelParts] = subarg.split(':');
@@ -804,6 +888,87 @@ async function handleCommand(line: string, ctx: Ctx): Promise<boolean> {
       );
       return false;
 
+    case 'history': {
+      // Reads session.transcript straight from memory — no DB, no network —
+      // so it stays fast regardless of how big the graph or the corpus gets.
+      if (arg === 'clear') {
+        session.transcript = [];
+        console.log(color.grey('  conversation memory cleared'));
+        return false;
+      }
+      if (session.transcript.length === 0) {
+        console.log(color.grey('  no conversation memory yet'));
+        return false;
+      }
+      const oneLine = (s: string): string => {
+        const flat = s.replace(/\s+/g, ' ').trim();
+        return flat.length > 140 ? `${flat.slice(0, 140)}…` : flat;
+      };
+      console.log('');
+      for (const turn of session.transcript) {
+        const tag = turn.role === 'user' ? color.cyan('you') : color.green('answer');
+        console.log(`  ${tag}  ${oneLine(turn.content)}`);
+      }
+      console.log(
+        color.dim(
+          `\n  ${session.transcript.length} entries · ~${estimateTokens(session.transcript.map((t) => t.content).join(''))} tok · /history clear to reset`,
+        ),
+      );
+      return false;
+    }
+
+    case 'folder': {
+      if (!arg) {
+        console.log(color.dim('  agent tool calls (list/read/write/edit) are confined to: ') + session.sandbox.root);
+        console.log(color.grey('  /folder <path> to point them somewhere else — created if it does not exist yet'));
+        return false;
+      }
+      const abs = resolvePath(arg);
+      const blocked = guardFolderRoot(abs);
+      if (blocked) {
+        console.log(color.red(`  ${blocked}`));
+        return false;
+      }
+      try {
+        session.sandbox = new Sandbox(abs);
+      } catch (err) {
+        console.log(color.red(`  could not use ${abs}: ${err instanceof Error ? err.message : String(err)}`));
+        return false;
+      }
+      console.log(color.green(`  agent tool calls now confined to ${session.sandbox.root}`));
+      return false;
+    }
+
+    case 'permissions':
+    case 'perms': {
+      // A direct command, not just the /settings menu entry — the menu needs
+      // a real raw-mode terminal (arrow keys), which a piped session or a
+      // quick "just switch to auto" moment does not have. Silent readonly by
+      // default has real cost: it is the whole explanation for a model that
+      // pastes HTML into chat instead of writing a file — it was never GIVEN
+      // write_file to call, and nothing said so out loud.
+      if (!arg) {
+        console.log(color.dim('  permissions: ') + color.bold(session.permissions));
+        console.log('');
+        for (const m of MODES) {
+          const marker = m === session.permissions ? color.green(' ← current') : '';
+          console.log(`  ${describeMode(m)}${marker}`);
+        }
+        console.log(color.grey(`\n  /permissions <${MODES.join('|')}> to change`));
+        return false;
+      }
+      const mode = arg.trim().toLowerCase();
+      if (!(MODES as readonly string[]).includes(mode)) {
+        console.log(color.red(`  unknown mode '${arg}' — use ${MODES.join(', ')}`));
+        return false;
+      }
+      session.permissions = mode as PermissionMode;
+      console.log(color.green(`  permissions = ${mode}`));
+      console.log(color.grey(`  ${describeMode(mode as PermissionMode)}`));
+      syncBar(ctx);
+      return false;
+    }
+
     default:
       console.log(color.red(`  unknown command /${cmd} — try /help`));
       return false;
@@ -832,6 +997,30 @@ async function runLearn(ctx: Ctx, topic: string, signal?: AbortSignal): Promise<
         ` (${res.edgesPruned} pruned, ${res.conceptsRejected} ungrounded concepts discarded)`,
     ),
   );
+}
+
+/**
+ * Cap on transcript token budget, as a fraction of the context window.
+ *
+ * Left generous room for the system prompt (which carries the routed CONTEXT
+ * block — often the bulk of a turn) plus the current query and its answer.
+ * A fixed fraction rather than a fixed token count: a 4k-context node and a
+ * 128k-context node should not carry the same amount of history.
+ */
+const TRANSCRIPT_BUDGET_FRACTION = 0.25;
+/** Hard ceiling regardless of token budget — many short turns should not pile up forever. */
+const TRANSCRIPT_MAX_ENTRIES = 24;
+
+/** Drop the oldest turns until the transcript fits its token and count budget. */
+function trimTranscript(session: Session, numCtx: number): void {
+  const budget = Math.max(0, Math.floor(numCtx * TRANSCRIPT_BUDGET_FRACTION));
+  while (session.transcript.length > TRANSCRIPT_MAX_ENTRIES) session.transcript.shift();
+  while (
+    session.transcript.length > 0 &&
+    estimateTokens(session.transcript.map((t) => t.content).join('\n')) > budget
+  ) {
+    session.transcript.shift();
+  }
 }
 
 /**
@@ -877,6 +1066,11 @@ async function handleQuery(
     // that phrase retrieves nothing and would drop the context the first half
     // of the answer was written against.
     const rootQuery = history[0]?.content ?? query;
+    // `/continue` supplies its own two-entry history; everything else draws on
+    // the session's rolling short-term memory instead. Kept separate from
+    // `history` because they answer different questions — one resumes a single
+    // truncated answer, the other is "what has this conversation covered".
+    const conversation = history.length > 0 ? history : session.transcript;
     let result = await route(db, rootQuery, {
       effort: resolved.effort,
       baseThresholds: activeThresholds(),
@@ -885,14 +1079,27 @@ async function handleQuery(
       signal: controller.signal,
     });
 
-    // Hybrid learning: touch the network when the graph has a gap — with two
+    // Hybrid learning: touch the network when the graph has a gap — with four
     // guards on top. A query with no extractable entity at all is junk, not a
     // gap (the "l" incident: 91 seconds and Wikipedia's letter article for a
-    // stray keypress). And at max effort every query learns, because recall
-    // beats latency there — the "always search" mode, opt-in per /effort.
+    // stray keypress). At max effort every query learns, because recall beats
+    // latency there — the "always search" mode, opt-in per /effort. A term
+    // the conversation itself just introduced ("wdym <thing I just said>?") is
+    // not a gap in the GRAPH at all — it is answerable from what is already on
+    // screen, and sending it to a web search instead is the wrong tool for a
+    // question that was never about general knowledge. And naming one of THIS
+    // app's own tools ("use write_file") is an instruction about this
+    // session, not a subject that exists anywhere on the web to learn about —
+    // the "use write_file" incident: 27 seconds fetching unrelated German
+    // consumer-protection sites because "write_file" had no graph entry.
     const gap = result.trace.knowledgeGap;
+    const recentTurns = conversation.slice(-6).map((t) => t.content).join('\n').toLowerCase();
+    const coveredByConversation =
+      gap && recentTurns.length > 0 && result.trace.entities.some((e) => recentTurns.includes(e.toLowerCase()));
+    const mentionsOwnTool = gap && AGENT_TOOL_NAMES.some((t) => new RegExp(`\\b${t}\\b`, 'i').test(query));
+    const skipLearn = coveredByConversation || mentionsOwnTool;
     let hasSubstance = result.trace.entities.length > 0;
-    if (hasSubstance && gap) {
+    if (!skipLearn && hasSubstance && gap) {
       // The word judge: measured evidence (corpus distribution, titles, a
       // cached dictionary) that the query names a subject worth 90 seconds of
       // web search. Basic words do not buy a learn cycle. It only ever blocks;
@@ -900,7 +1107,7 @@ async function handleQuery(
       const judged = await anySubject(ctx.db, result.trace.entities, dictionaryPosFetcher(ctx.db));
       hasSubstance = judged.yes;
     }
-    const wantsLearn = gap ? hasSubstance : session.effort === 'max';
+    const wantsLearn = skipLearn ? false : gap ? hasSubstance : session.effort === 'max';
     if (wantsLearn) {
       const s = result.trace.signals;
       console.log(
@@ -917,6 +1124,10 @@ async function handleQuery(
         extractor: provider.current,
         signal: controller.signal,
       });
+    } else if (gap && coveredByConversation) {
+      console.log(color.grey('  covered earlier in this conversation — answering from context, not the graph'));
+    } else if (gap && mentionsOwnTool) {
+      console.log(color.grey('  names a tool this app has, not a subject to search for — answering directly'));
     } else if (gap) {
       console.log(color.grey('  nothing in the graph, and nothing worth searching for in that — answering directly'));
     }
@@ -977,6 +1188,32 @@ async function handleQuery(
     // definition what the model can always do. The model decides whether a
     // question needs a file written; the CLI does not decide it on the model's
     // behalf from a regex.
+    // (`canWrite` returns a decision OBJECT, not a boolean. `canWrite(x) ? …`
+    //  is therefore always truthy — read `.allowed`.)
+    const allowedTools = canWrite(session.permissions).allowed ? AGENT_TOOL_NAMES : READONLY_TOOL_NAMES;
+    // Say out loud, BEFORE generating, that this request cannot produce a
+    // file in this mode.
+    //
+    // readonly is the default and is easy to still be in without noticing —
+    // and the failure it produces does not look like a permission problem.
+    // The model was simply never handed `write_file`, so it does the only
+    // thing left: prints the file into the chat, calls `verify` on a path
+    // that was never created, and reports "file does not exist" as though
+    // something went wrong. Nothing in that sequence names the actual cause.
+    //
+    // Checked against build INTENT, not against the literal tool names — an
+    // earlier version only fired for a query containing the string
+    // "write_file", which no ordinary request ("make me a login page") ever
+    // does, so the warning never appeared for the case that needed it.
+    const wantsToBuild = BUILD_INTENT.test(query);
+    const blocked = AGENT_TOOL_NAMES.filter((t) => !allowedTools.includes(t));
+    if (blocked.length > 0 && (wantsToBuild || blocked.some((t) => new RegExp(`\\b${t}\\b`, 'i').test(query)))) {
+      console.log(
+        color.yellow(`  ! ${session.permissions} mode cannot create or change files — nothing will be written`) +
+          color.grey(`  (/permissions auto)`),
+      );
+    }
+
     const system = buildSystemPrompt({
       task: 'build',
       tier: promptTier(ctx),
@@ -987,11 +1224,15 @@ async function handleQuery(
       // sandbox will actually permit: telling a read-only session it has
       // `write_file` produces a call that gets refused, and the model then
       // treats the refusal as a bug in its own arguments and retries.
-      //
-      // (`canWrite` returns a decision OBJECT, not a boolean. `canWrite(x) ? …`
-      //  is therefore always truthy — read `.allowed`.)
-      tools: canWrite(session.permissions).allowed ? AGENT_TOOL_NAMES : READONLY_TOOL_NAMES,
+      tools: allowedTools,
       context: result.context || undefined,
+      // Still `task: 'build'` regardless — capability must never depend on a
+      // regex guess (see the note above `namedButBlocked`/`BUILD_INTENT`: an
+      // earlier version of this exact mistake, tried and reverted). This only
+      // adds the proportionality counterweight for a query that does not look
+      // like a build request, so "wsp" or "can cows fly?" doesn't get a
+      // 3000-token agent prompt with nothing telling it a short answer is fine.
+      conversational: !wantsToBuild,
     }).text;
 
     stdout.write('\n');
@@ -1005,24 +1246,136 @@ async function handleQuery(
     const genStart = Date.now();
     let streamed = 0;
     ctx.bar.set({ busy: true, tps: 0 });
-    const gen = await provider.current.generate({
-      system,
-      messages: [...history, { role: 'user', content: query }],
-      effort: resolved.effort,
-      thinking: resolved.thinking,
-      maxTokens: getSettings().maxTokens,
-      signal: controller.signal,
-      onToken: (t) => {
-        // The first answer token is what actually ends the reasoning block —
-        // providers do not always signal it separately.
-        think.finish();
-        stdout.write(t);
-        streamed += 1;
-        const secs = (Date.now() - genStart) / 1000;
-        if (secs > 0.5) ctx.bar.set({ tps: streamed / secs, busy: true });
-      },
-      onThinking: (t) => think.push(t),
-    });
+
+    const onToken = (t: string): void => {
+      // The first answer token is what actually ends the reasoning block —
+      // providers do not always signal it separately.
+      think.finish();
+      stdout.write(t);
+      streamed += 1;
+      const secs = (Date.now() - genStart) / 1000;
+      if (secs > 0.5) ctx.bar.set({ tps: streamed / secs, busy: true });
+    };
+
+    // Tool calls (list/read/write/edit/verify) only work against Ollama's
+    // native /api/chat — this is the same reason `agent/loop.ts` talks to it
+    // directly instead of going through the generic Provider interface. An
+    // OpenAI/Anthropic/splitllm endpoint still answers, just without tools;
+    // the system prompt above already adjusts what it claims it can do via
+    // `tools:`, so it never promises what this branch cannot deliver.
+    let gen: { text: string; usage: { inputTokens: number; outputTokens: number; costUsd: number }; truncated?: boolean; tokensPerSecond?: number };
+    if (local) {
+      // 'ask' mode is the one permission tier where a write/edit tool call
+      // needs a real answer from the user, not just a yes/no on whether the
+      // TOOL is offered at all — readonly/auto/yolo are already fully decided
+      // by `allowedTools` below.
+      const confirmWrite =
+        session.permissions === 'ask'
+          ? async (path: string, action: 'write' | 'edit'): Promise<boolean> => {
+              const yn = ((await ctx.lines.next(`  allow ${action} → ${path}? [y/N] `)) ?? '').trim().toLowerCase();
+              return yn === 'y' || yn === 'yes';
+            }
+          : undefined;
+
+      // A real browser for `verify`, launched ONLY if the model actually asks
+      // to verify an HTML file. Without one, verify fell back to source-only
+      // checks and never caught a page that loads but throws — which is most
+      // of what goes wrong with generated pages. Launching eagerly instead
+      // would put a Chromium start-up on every ordinary chat turn, so this
+      // stays lazy and is torn down in the `finally` below.
+      let verifyBrowser: Browser | undefined;
+      let verifyPage: Page | undefined;
+      const pageProvider = async (): Promise<Page | undefined> => {
+        if (verifyPage) return verifyPage;
+        if (!findBrowser()) return undefined; // no Chromium-family browser installed
+        try {
+          verifyBrowser = await Browser.launch();
+          verifyPage = await verifyBrowser.newPage();
+          return verifyPage;
+        } catch {
+          return undefined; // verify degrades to source checks, never breaks the turn
+        }
+      };
+
+      try {
+      const run = await runAgent(session.sandbox, query, {
+        model: provider.current.model,
+        chatUrl: `${local.baseUrl}/api/chat`,
+        systemOverride: system,
+        history: conversation,
+        allowedTools,
+        confirmWrite,
+        // Needs room for the raised maxTokens below PLUS everything already
+        // in the prompt (system, routed CONTEXT, conversation) — otherwise
+        // Ollama silently SHIFTS the window mid-generation once num_ctx is
+        // reached, which loses the top of the file being written rather
+        // than stopping cleanly.
+        numCtx: Math.max(activeEp?.perf?.numCtx ?? getSettings().numCtx, 24_000),
+        // A write_file call carries the WHOLE file JSON-escaped as one
+        // argument — escaping roughly doubles its effective token cost — so
+        // the "Max answer length" setting (1200 by default, sized for a
+        // chat reply) truncates a real page mid-argument. Ollama's own
+        // tool-call parser then rejects the cut-off JSON outright rather
+        // than returning a truncated-but-readable answer, which is a much
+        // worse failure than a longer wait. MEASURED: a single-file
+        // Tailwind/CSS/JS dashboard from this project's default 0.8B model
+        // needed ~9k tokens once escaped; 6000 still truncated it, 12000
+        // didn't. Only raised for this path; a plain chat reply keeps the
+        // configured length.
+        maxTokens: Math.max(getSettings().maxTokens, 12_000),
+        thinking: resolved.thinking,
+        numGpu: numGpuFor(activeEp?.perf?.compute),
+        numThread: activeEp?.perf ? threadsForNode(activeEp.perf, activeEp.node) : threadsFor(getSettings()),
+        signal: controller.signal,
+        pageProvider,
+        onProgress: onToken,
+        onThinking: (t) => think.push(t),
+        onStep: (s) => {
+          const preview = (s.output.split('\n')[0] ?? '').slice(0, 100);
+          console.log(color.grey(`\n  [${s.tool}] ${s.ok ? '✓' : '✗'} ${preview}`));
+        },
+      });
+
+      if (run.stopped === 'error') {
+        console.log(color.red(`\n  agent error: ${run.finalText}`));
+      } else if (run.stopped === 'stalled') {
+        console.log(color.yellow('\n  stopped: repeated tool-call failures'));
+      }
+      if (run.filesWritten.length > 0) {
+        console.log(color.green(`\n  wrote: ${run.filesWritten.join(', ')}`));
+      }
+
+      gen = {
+        text: run.finalText,
+        usage: { inputTokens: run.usage.inputTokens, outputTokens: run.usage.outputTokens, costUsd: 0 },
+        truncated: run.truncated,
+      };
+      } finally {
+        // Chromium outlives this process if it is not closed — and a headless
+        // instance per query would accumulate silently.
+        try {
+          await verifyPage?.close();
+        } catch {
+          /* already gone */
+        }
+        try {
+          await verifyBrowser?.close();
+        } catch {
+          /* already gone */
+        }
+      }
+    } else {
+      gen = await provider.current.generate({
+        system,
+        messages: [...conversation, { role: 'user', content: query }],
+        effort: resolved.effort,
+        thinking: resolved.thinking,
+        maxTokens: getSettings().maxTokens,
+        signal: controller.signal,
+        onToken,
+        onThinking: (t) => think.push(t),
+      });
+    }
     think.finish(); // no answer tokens at all (empty reply, or thinking only)
     stdout.write('\n');
 
@@ -1037,21 +1390,37 @@ async function handleQuery(
 
     // Context is what the model saw this turn plus what it produced. The system
     // prompt carries the routed CONTEXT block, so it is the bulk of it and cannot
-    // be left out of the estimate.
-    session.contextUsed = estimateTokens(system + query) + gen.usage.outputTokens;
+    // be left out of the estimate — and neither can the conversation history now
+    // riding along with every turn.
+    session.contextUsed =
+      estimateTokens(system + query + conversation.map((m) => m.content).join('')) + gen.usage.outputTokens;
     syncBar(ctx, { busy: false, tps: rate });
 
     const tps = rate > 0 ? ` @ ${rate.toFixed(1)} tok/s` : '';
     console.log(color.dim(`\n  ${gen.usage.inputTokens} in / ${gen.usage.outputTokens} out${tps}`));
+
+    // The full text of this turn's answer, `/continue` accumulation included —
+    // shared by `lastAnswer` (which only cares about the truncated case) and
+    // the transcript (which wants the real answer regardless).
+    const fullAnswerText = history.length > 0 ? (history[1]?.content ?? '') + gen.text : gen.text;
+
+    if (history.length > 0) {
+      // `/continue`: extend the transcript entry the original turn already
+      // wrote, rather than adding "Continue the previous answer…" as its own
+      // turn — that instruction is plumbing, not something the user said.
+      const last = session.transcript[session.transcript.length - 1];
+      if (last?.role === 'assistant') last.content = fullAnswerText;
+    } else {
+      session.transcript.push({ role: 'user', content: query }, { role: 'assistant', content: gen.text });
+    }
+    trimTranscript(session, getSettings().numCtx);
 
     // Truncation was previously invisible: Ollama has always reported it and
     // nothing read the field, so a file cut off mid-function was indistinguishable
     // from a finished one. Saying so is most of the value; /continue is the rest.
     // Accumulate across repeated /continue, so a third one resumes from the
     // whole answer rather than from the most recent fragment of it.
-    session.lastAnswer = gen.truncated
-      ? { query: rootQuery, text: (history[1]?.content ?? '') + gen.text }
-      : undefined;
+    session.lastAnswer = gen.truncated ? { query: rootQuery, text: fullAnswerText } : undefined;
     if (gen.truncated) {
       console.log(
         color.yellow(`  ! cut off at the ${getSettings().maxTokens}-token limit`) +
@@ -1087,6 +1456,9 @@ ${color.bold('  commands')}
     /effort <low..max>          router breadth: seeds, hops, modules, pages
     /think <on|off|show>        toggle reasoning; 'show' displays it
     /continue                   resume an answer that hit the token limit
+    /history [clear]            recent conversation memory used for follow-ups
+    /folder [path]              where read/write/edit tool calls are confined
+    /permissions [mode]         readonly|ask|auto|yolo — what tools the model has
     /design <brief>             generate a page, verify it, repair until it converges
     /site <brief>               build a full multi-section page, section by section
     /verify <file.html>         score an existing page against the design checks

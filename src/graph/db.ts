@@ -85,6 +85,35 @@ export class GraphDb {
     }
     if (!sql) throw new Error(`schema.sql not found. Looked in:\n  ${candidates.join('\n  ')}`);
     this.db.exec(sql);
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+    );
+    this.backfillPageFts();
+  }
+
+  /**
+   * One-time catch-up for `page_fts`, an external-content FTS table added
+   * after `page_cache` already had rows. Triggers only fire for FUTURE
+   * writes, so on an existing database the index would otherwise start
+   * empty and `termDomainBreadth` would silently read every term as 0%
+   * breadth until each page happened to be re-fetched.
+   *
+   * Gated by an explicit row in `migrations`, NOT by comparing row counts —
+   * counting rows in an EXTERNAL-CONTENT FTS5 table is not a reliable signal
+   * of whether anything is actually indexed. Measured directly: on this
+   * project's own database, `SELECT COUNT(*) FROM page_fts` reported 176
+   * (matching `page_cache` exactly) while `page_fts MATCH '"html"'` — a term
+   * that is in literally every cached page — matched ZERO rows. The count
+   * reflects the row space of the LINKED table, not the inverted index; an
+   * empty index and a fully-populated one can report the identical count.
+   * `'rebuild'` is FTS5's own documented command for exactly this situation:
+   * repopulate an external-content index from its source table from scratch.
+   */
+  private backfillPageFts(): void {
+    const done = this.db.prepare("SELECT 1 AS x FROM migrations WHERE name = 'page_fts_backfill_v1'").get();
+    if (done) return;
+    this.db.exec(`INSERT INTO page_fts(page_fts) VALUES('rebuild')`);
+    this.db.exec("INSERT OR IGNORE INTO migrations (name) VALUES ('page_fts_backfill_v1')");
   }
 
   close(): void {
@@ -367,49 +396,41 @@ export class GraphDb {
    * corpus grows — 5 hostnames out of 10 means the same thing as 50 out of 100.
    */
   termDomainBreadth(terms: readonly string[]): Map<string, number> {
-    const index = this.tokenDomainIndex();
     const out = new Map<string, number>();
-    const total = Math.max(1, index.domains);
+    if (terms.length === 0) return out;
+    const total = Math.max(1, this.distinctPageDomains());
+    // MATCH, not a raw substring split — the whole point is that this now
+    // goes through the SAME porter stemmer the actual retrieval search does,
+    // so a term's measured breadth and its measured rarity never again
+    // silently disagree about what a "word" is (see schema.sql, page_fts).
+    const stmt = this.db.prepare('SELECT COUNT(DISTINCT domain) AS c FROM page_fts WHERE page_fts MATCH ?');
     for (const t of terms) {
-      out.set(t, (index.byToken.get(t.toLowerCase())?.size ?? 0) / total);
+      const match = ftsQuery(t);
+      if (!match) {
+        out.set(t, 0);
+        continue;
+      }
+      try {
+        const r = stmt.get(match) as { c: number };
+        out.set(t, r.c / total);
+      } catch {
+        out.set(t, 0);
+      }
     }
     return out;
   }
 
-  /**
-   * token -> set of hostnames containing it, built once and reused.
-   *
-   * Built in a single pass because the alternative — scanning every cached body
-   * per term — is 780 KB x 248 pages per lookup, which turns a learn cycle into
-   * a minutes-long stall.
-   */
-  private tokenIndexCache?: { byToken: Map<string, Set<string>>; domains: number; pages: number };
+  private domainCountCache?: { count: number; pages: number };
 
-  private tokenDomainIndex(): { byToken: Map<string, Set<string>>; domains: number } {
-    const pages = this.cachedPages();
-    if (this.tokenIndexCache && this.tokenIndexCache.pages === pages.length) {
-      return this.tokenIndexCache;
+  /** Distinct hostnames across every cached page — the denominator for breadth. */
+  private distinctPageDomains(): number {
+    const pages = this.db.prepare('SELECT COUNT(*) AS c FROM page_cache').get() as { c: number };
+    if (this.domainCountCache && this.domainCountCache.pages === pages.c) {
+      return this.domainCountCache.count;
     }
-    const byToken = new Map<string, Set<string>>();
-    const domains = new Set<string>();
-    for (const p of pages) {
-      domains.add(p.domain);
-      const text = p.body
-        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .toLowerCase();
-      // A Set per page, so one page mentioning a word fifty times still counts
-      // its hostname once. Breadth, not frequency, is the signal.
-      for (const tok of new Set(text.split(/[^a-z0-9]+/))) {
-        if (tok.length < 3 || tok.length > 30) continue;
-        let s = byToken.get(tok);
-        if (!s) byToken.set(tok, (s = new Set()));
-        s.add(p.domain);
-      }
-    }
-    this.tokenIndexCache = { byToken, domains: domains.size, pages: pages.length };
-    return this.tokenIndexCache;
+    const row = this.db.prepare('SELECT COUNT(DISTINCT domain) AS c FROM page_cache').get() as { c: number };
+    this.domainCountCache = { count: row.c, pages: pages.c };
+    return row.c;
   }
 
   /** Cached page bodies, for corpus statistics (the word judge). */
@@ -658,11 +679,24 @@ export function ftsQuery(raw: string): string | undefined {
   return uniq.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
 }
 
-/** The tokenizer behind ftsQuery, exported so rarity can be measured per token. */
+/**
+ * The tokenizer behind ftsQuery, exported so rarity can be measured per token.
+ *
+ * `\p{L}`/`\p{N}` (Unicode property escapes, not `a-z0-9`) are load-bearing:
+ * an ASCII-only split treats every non-ASCII letter as a word BOUNDARY, so
+ * "Wörterbuch" split into "w" + "rterbuch" and "café" into "caf". The word
+ * did not just lose an accent, it was torn into unrelated fragments — and
+ * because `ftsQuery` builds its MATCH terms from this same function, that
+ * corruption reached the search query too, not just the stats derived from
+ * it: a German or French query silently searched for the wrong tokens
+ * against an index (`module_fts`, tokenize='porter unicode61') that was
+ * indexing the words correctly the whole time. `judgeWord`'s corpus signals
+ * inherit the same fix for free, since they tokenize through here too.
+ */
 export function tokenizeFts(raw: string): string[] {
   return raw
     .toLowerCase()
-    .split(/[^a-z0-9_+#.-]+/)
+    .split(/[^\p{L}\p{N}_+#.-]+/u)
     .map((t) => t.replace(/^[-.]+|[-.]+$/g, ''))
     .filter((t) => t.length >= 2);
 }

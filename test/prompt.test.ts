@@ -108,11 +108,30 @@ test('compact really is materially shorter than full', () => {
 const AGENT_COMPACT_BUDGET = 600;
 
 test('the compact agent prompt stays inside its drift guard', () => {
-  const p = buildSystemPrompt({ task: 'agent', tier: 'compact', tools: ['read_file', 'write_file', 'verify'] });
-  assert.ok(
-    p.approxTokens < AGENT_COMPACT_BUDGET,
-    `compact agent prompt is ${p.approxTokens} tokens, over the ${AGENT_COMPACT_BUDGET} guard`,
-  );
+  // BOTH tool sets, because they take different branches: a write-capable
+  // session is told what `write_file` means, a read-only one is told it
+  // cannot write at all. Checking only the first let the read-only variant
+  // drift 7 tokens over the guard unnoticed.
+  for (const tools of [
+    ['read_file', 'write_file', 'verify'],
+    ['list_files', 'read_file', 'verify'],
+  ]) {
+    const p = buildSystemPrompt({ task: 'agent', tier: 'compact', tools });
+    assert.ok(
+      p.approxTokens < AGENT_COMPACT_BUDGET,
+      `compact agent prompt [${tools.join(',')}] is ${p.approxTokens} tokens, over the ${AGENT_COMPACT_BUDGET} guard`,
+    );
+  }
+});
+
+test('a session that cannot write is told so, and one that can is not', () => {
+  // The readonly failure this prevents: the model prints the file into its
+  // reply, calls `verify` on a path that was never created, and reports
+  // "file does not exist" — a sequence that never names the actual cause.
+  const ro = buildSystemPrompt({ task: 'agent', tools: ['list_files', 'read_file', 'verify'] });
+  const rw = buildSystemPrompt({ task: 'agent', tools: ['read_file', 'write_file', 'verify'] });
+  assert.match(ro.text, /CANNOT create or change files/);
+  assert.ok(!rw.text.includes('CANNOT create or change files'));
 });
 
 // ---------------------------------------------------------------------------

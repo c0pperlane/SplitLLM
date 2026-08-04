@@ -168,6 +168,33 @@ function progressPrinter(): (p: PullEvent) => void {
   };
 }
 
+/**
+ * Ollama's own pull errors are accurate but assume the reader already knows
+ * why a manifest would be missing. Two shapes account for most confused
+ * reports here, and both have a specific, correctable cause:
+ *
+ * - `owner/repo` with no `hf.co/` prefix is a syntactically valid Ollama
+ *   reference too — just to ITS OWN registry, which has no such namespace.
+ *   The 404 reads identically to "this model doesn't exist anywhere", which
+ *   is not what happened.
+ * - `hf.co/owner/repo` pointed at a HuggingFace repo that holds the
+ *   safetensors weights but not a GGUF conversion of them — common, because
+ *   the GGUF is usually a SEPARATE, differently-named repo (often with a
+ *   `-GGUF` suffix) that the base repo's page does not always link clearly.
+ */
+function explainPullFailure(model: string, message: string): string {
+  const looksLikeBareHfRef = /^[\w.-]+\/[\w.-]+$/.test(model) && !model.startsWith('hf.co/');
+  if (looksLikeBareHfRef && /manifest.*(does not exist|not found)|file does not exist/i.test(message)) {
+    return `${message}\n    '${model}' has no colon-tag and no registry prefix, so Ollama looked for it in ITS OWN library, not HuggingFace.` +
+      `\n    If you meant a HuggingFace repo, pull 'hf.co/${model}' instead — or search for it with /models, key s.`;
+  }
+  if (/not gguf|not compatible with llama\.cpp/i.test(message)) {
+    return `${message}\n    This HuggingFace repo holds the base weights, not a GGUF conversion — Ollama can only run GGUF.` +
+      `\n    Look for a sibling repo (often named '…-GGUF') via /models, key s, rather than pulling this one directly.`;
+  }
+  return message;
+}
+
 async function pullWithProgress(ctx: ModelBrowserCtx, model: string): Promise<void> {
   // A multi-GB download is the longest wait this UI has; ^C must end it.
   const controller = new AbortController();
@@ -178,8 +205,12 @@ async function pullWithProgress(ctx: ModelBrowserCtx, model: string): Promise<vo
     console.log(color.green(`  installed ${model}`));
   } catch (err) {
     stdout.write('\n');
-    if (controller.signal.aborted) console.log(color.yellow('  pull cancelled'));
-    else console.log(color.red(`  pull failed: ${err instanceof Error ? err.message : String(err)}`));
+    if (controller.signal.aborted) {
+      console.log(color.yellow('  pull cancelled'));
+    } else {
+      const message = err instanceof Error ? err.message : String(err);
+      console.log(color.red(`  pull failed: ${explainPullFailure(model, message)}`));
+    }
   } finally {
     ctx.setInterrupt?.(undefined);
   }
@@ -450,7 +481,9 @@ export async function runModelBrowser(ctx: ModelBrowserCtx): Promise<void> {
         return 'stay' as const;
       },
       p: async () => {
-        const name = (await ctx.ask('  model tag to pull (e.g. qwen3:8b or hf.co/owner/repo): ')).trim();
+        const name = (
+          await ctx.ask('  model tag to pull (e.g. qwen3:8b, or hf.co/owner/repo — the hf.co/ prefix is required for HuggingFace): ')
+        ).trim();
         if (name) {
           await pullWithProgress(ctx, name);
           await refetch();

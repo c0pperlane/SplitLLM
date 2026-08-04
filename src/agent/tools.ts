@@ -225,8 +225,16 @@ export class Sandbox {
   }
 }
 
-/** Tool schemas, in the shape Ollama's /api/chat expects. */
-export function toolSpecs(): ToolSpec[] {
+/**
+ * Tool schemas, in the shape Ollama's /api/chat expects.
+ *
+ * `allowed` narrows the list to specific tool names — how a permission mode
+ * (readonly vs. write-capable) limits what the model is even OFFERED, as
+ * opposed to `dispatch()` refusing a call after the fact. Both matter: the
+ * filtered list keeps the model from being told about a tool it cannot use,
+ * and the runtime check in `dispatch` is what actually enforces it.
+ */
+export function toolSpecs(allowed?: readonly string[]): ToolSpec[] {
   const s = (description: string, props: Record<string, string>, required: string[]): ToolSpec['function']['parameters'] => ({
     type: 'object',
     properties: Object.fromEntries(
@@ -235,7 +243,7 @@ export function toolSpecs(): ToolSpec[] {
     required,
   });
 
-  return [
+  const all: ToolSpec[] = [
     {
       type: 'function',
       function: {
@@ -281,4 +289,5 @@ export function toolSpecs(): ToolSpec[] {
       },
     },
   ];
+  return allowed ? all.filter((spec) => allowed.includes(spec.function.name)) : all;
 }

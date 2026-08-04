@@ -55,11 +55,17 @@ afterEach(() => restore());
 const all = (): string => written.join('');
 const since = (mark: number): string => written.slice(mark).join('');
 
-test('with no palette the region reserves exactly the prompt and status rows', () => {
+// The prompt zone is now PROMPT_ROWS (3) tall, not one row: readline has no
+// idea the row it writes to is pinned, and with only one row a long line's
+// own auto-wrap spilled onto the status row directly below it — the "reply
+// and status bar overwrite each other" bug. Prompt occupies rows 27..29,
+// status row 30.
+
+test('with no palette the region reserves the whole prompt zone and status row', () => {
   const bar = new StatusBar();
   bar.attach();
-  // rows 1..28 scroll; 29 is the prompt, 30 the status line.
-  assert.ok(all().includes(`${ESC}[1;${ROWS - 2}r`), all().replace(/\x1b/g, 'E'));
+  // rows 1..26 scroll; 27..29 are the prompt zone, 30 the status line.
+  assert.ok(all().includes(`${ESC}[1;${ROWS - 4}r`), all().replace(/\x1b/g, 'E'));
   bar.detach();
 });
 
@@ -70,9 +76,9 @@ test('opening the palette shrinks the region by exactly its height', () => {
 
   bar.setPalette(['a', 'b', 'c'], 3);
   const out = since(mark);
-  assert.ok(out.includes(`${ESC}[1;${ROWS - 5}r`), 'region did not shrink by 3');
-  // Palette occupies the three rows directly above the prompt row (29).
-  for (const row of [26, 27, 28]) assert.ok(out.includes(`${ESC}[${row};1H`), `row ${row} unpainted`);
+  assert.ok(out.includes(`${ESC}[1;${ROWS - 7}r`), 'region did not shrink by 3');
+  // Palette occupies the three rows directly above the prompt zone (27..29).
+  for (const row of [24, 25, 26]) assert.ok(out.includes(`${ESC}[${row};1H`), `row ${row} unpainted`);
   bar.detach();
 });
 
@@ -82,7 +88,7 @@ test('the region is restored when the palette closes', () => {
   bar.setPalette(['a', 'b', 'c'], 3);
   const mark = written.length;
   bar.setPalette([], 3);
-  assert.ok(since(mark).includes(`${ESC}[1;${ROWS - 2}r`), 'region not given back');
+  assert.ok(since(mark).includes(`${ESC}[1;${ROWS - 4}r`), 'region not given back');
   bar.detach();
 });
 
@@ -93,9 +99,9 @@ test('shrinking the palette clears the rows it vacated', () => {
   const mark = written.length;
   bar.setPalette(['a'], 3);
   const out = since(mark);
-  // The old band ran 24..28; all of it must be erased, not just the new row,
+  // The old band ran 22..26; all of it must be erased, not just the new row,
   // or the tail of the longer list is stranded inside the conversation area.
-  for (const row of [24, 25, 26, 27, 28]) {
+  for (const row of [22, 23, 24, 25, 26]) {
     assert.ok(out.includes(`${ESC}[${row};1H${ESC}[2K`), `row ${row} not cleared`);
   }
   bar.detach();
@@ -118,14 +124,27 @@ test('while a prompt is live, nothing else touches the DECSC slot', () => {
   bar.detach();
 });
 
-test('painting during a prompt returns the cursor to readline’s column', () => {
+test('painting during a prompt returns the cursor to readline’s row and column', () => {
   const bar = new StatusBar();
   bar.attach();
   bar.beginPrompt();
   const mark = written.length;
-  bar.setPalette(['a'], 11);
-  // Prompt row is 29; column 11 is where readline left the caret.
+  // Row offset 2 is the bottom of the 3-row zone (27..29) — a line that has
+  // wrapped all the way down to the last reserved row, column 11.
+  bar.setPalette(['a'], 11, 2);
   assert.ok(since(mark).endsWith(`${ESC}[29;11H`), since(mark).replace(/\x1b/g, 'E'));
+  bar.detach();
+});
+
+test('painting during a prompt with a short line returns to the TOP of the prompt zone', () => {
+  const bar = new StatusBar();
+  bar.attach();
+  bar.beginPrompt();
+  const mark = written.length;
+  // No row offset: the cursor has not wrapped, so it sits on the first row
+  // of the zone (27), not the fixed old single prompt row (29).
+  bar.setPalette(['a'], 5);
+  assert.ok(since(mark).endsWith(`${ESC}[27;5H`), since(mark).replace(/\x1b/g, 'E'));
   bar.detach();
 });
 
@@ -165,7 +184,7 @@ test('detach hands back the whole window and leaves no reserved rows painted', (
   const mark = written.length;
   bar.detach();
   const out = since(mark);
-  for (const row of [27, 28, 29, 30]) {
+  for (const row of [25, 26, 27, 28, 29, 30]) {
     assert.ok(out.includes(`${ESC}[${row};1H${ESC}[2K`), `row ${row} left dirty`);
   }
   assert.ok(out.includes(`${ESC}[r`), 'scroll region not reset — the shell stays confined');

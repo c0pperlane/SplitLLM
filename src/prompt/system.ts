@@ -66,6 +66,14 @@ export interface PromptOptions {
   extra?: string[];
   /** Language to mirror. Omitted means "match the user". */
   language?: string;
+  /**
+   * The query doesn't look like a build/action request — add the "is this
+   * reply proportionate?" counterweight even under `task: 'build'`. Purely a
+   * steering nudge: tools and capability are identical either way, so a
+   * caller's imperfect guess only ever costs one extra self-check question,
+   * never access to anything.
+   */
+  conversational?: boolean;
 }
 
 export interface BuiltPrompt {
@@ -468,6 +476,23 @@ function agentMethod(tier: PromptTier, tools?: string[]): string[] {
   L.push('Call one tool at a time and wait for its result before deciding the next step.');
   L.push('Read a file before editing it. Edit anchors must be copied EXACTLY from what you read, whitespace included.');
   if (tools?.length) L.push(`Tools available: ${tools.join(', ')}. Do not call anything else.`);
+  if (tools?.includes('write_file')) {
+    // The one instruction this exists to enforce, stated as bluntly and as
+    // briefly as possible — this fires at compact tier, the tightest budget
+    // in the whole prompt, so it cannot afford to be the fuller explanation
+    // that would otherwise be worth writing. Printing a file's contents in
+    // the answer is not the same action as write_file, and a model asked to
+    // "build a dashboard" defaults to the conversational habit — a code
+    // block in prose — unless told this task does not end there.
+    L.push('`write_file` must actually be CALLED to create a file. Printing its contents in your answer does not.');
+  } else if (tools?.length) {
+    // No write tool in this mode. Without saying so, the model improvises:
+    // it prints the file into the reply, then calls `verify` on a path that
+    // was never created and reports "file does not exist" as if something
+    // failed — a sequence that never names the real reason. Naming the limit
+    // turns a confusing non-answer into a correct one.
+    L.push('You CANNOT create or change files here. Say so plainly if asked to build something.');
+  }
   L.push('Write the whole file when creating it. Do not leave "..." or "rest unchanged" in file content.');
   if (tier !== 'compact') {
     L.push('Prefer the smallest change that fixes the problem. A rewrite hides which line mattered.');
@@ -583,7 +608,7 @@ function contextRules(hasContext: boolean): string[] {
  * real estate in the whole thing, so it holds only the checks whose absence
  * produced a broken artefact in practice.
  */
-function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string[] {
+function checklist(task: PromptTask, tier: PromptTier, tools?: string[], conversational?: boolean): string[] {
   const L: string[] = ['# Before you stop'];
   const items: string[] = [];
   const has = (t: string): boolean => !tools || tools.includes(t);
@@ -594,6 +619,11 @@ function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string
     // satisfy by pretending — which is the exact failure the list is for.
     if (has('run_command')) items.push('Did you actually run the syntax check, or only intend to?');
     else if (has('verify')) items.push('Did you actually call `verify`, or only intend to?');
+    // The specific failure this catches: asked to build something, the model
+    // writes a fenced code block in its answer and calls that done. The
+    // block LOOKS like the deliverable, so nothing about the output signals
+    // that the file was never actually created.
+    if (has('write_file')) items.push('Called `write_file`, or only printed the code?');
     items.push('Is every file complete — no ellipses, no placeholders, no TODO?');
   }
   if (task === 'design' || task === 'build') {
@@ -601,10 +631,18 @@ function checklist(task: PromptTask, tier: PromptTier, tools?: string[]): string
     items.push('Are the empty, loading, error and success states all built?');
     items.push('Is every spacing value on your chosen scale?');
   }
-  if (task === 'chat' || task === 'answer') {
+  if (task === 'chat' || task === 'answer' || conversational) {
     // Counterweight. The item below it — "did you do all of what was asked" —
     // is the right question for a task and the wrong one for a greeting, and on
     // its own it is what turned `meow` into a 296-token project interview.
+    //
+    // `conversational` reaches this from `task === 'build'` too — every query
+    // uses that task regardless of shape (capability must never depend on a
+    // regex guess, see `agentMethod`'s own note on why that was tried and
+    // reverted), so a plain "wsp" or "can cows fly?" got the FULL agentic
+    // prompt with nothing to counterweight it, and answered like a confused
+    // command parser instead of just answering. This changes nothing about
+    // what tools are available — only this one extra self-check.
     items.push('Is the size of this reply proportionate to what was actually said?');
   }
   // These two close every checklist, for every task. They are the last thing
@@ -679,7 +717,7 @@ export function buildSystemPrompt(opts: PromptOptions): BuiltPrompt {
   if (tier === 'max') push('failures', workedFailures());
 
   if (opts.extra?.length) push('extra', opts.extra);
-  push('checklist', checklist(opts.task, tier, opts.tools));
+  push('checklist', checklist(opts.task, tier, opts.tools, opts.conversational));
 
   if (opts.context) {
     sections.push('context');

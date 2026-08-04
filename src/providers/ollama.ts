@@ -104,6 +104,12 @@ export class OllamaProvider implements Provider {
   private readonly perf?: NodePerf;
   private readonly node?: NodeInfo;
 
+  /** Where this instance points, so a caller can decide whether it is worth
+   * offering to start or install a LOCAL Ollama for it. */
+  get baseUrl(): string {
+    return this.host;
+  }
+
   constructor(model = DEFAULT_MODEL, host = DEFAULT_HOST, perf?: NodePerf, node?: NodeInfo) {
     this.model = model;
     this.host = host.replace(/\/$/, '');

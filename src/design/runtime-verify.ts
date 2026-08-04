@@ -104,6 +104,78 @@ export interface RuntimeOptions {
   expectAnimation?: boolean;
 }
 
+/** Does this look like JSX rather than ordinary JavaScript? */
+function looksLikeJsx(js: string): boolean {
+  // A capitalised component tag, or a lowercase HTML tag with an attribute or
+  // a self-close. Deliberately narrow: `a < b` and `x <span` differ by the
+  // tag name being followed by attribute/close syntax, and a bare `<` compare
+  // never is. Comments and strings can still produce a false positive, which
+  // costs one wrong finding, not a broken page.
+  return /<[A-Z][\w.]*[\s/>]|<(?:div|span|form|input|button|p|h[1-6]|ul|ol|li|a|img|section|header|footer|main|nav|label|textarea|select)\b[^>]*\/?>/.test(
+    js,
+  );
+}
+
+/**
+ * JSX that nothing will ever transpile.
+ *
+ * THE failure this catches, observed end to end: a generated login page loaded
+ * React and ReactDOM from a CDN, put its component in `app.js` full of JSX,
+ * and included no Babel at all. The browser parses `app.js` as ordinary
+ * JavaScript, hits `<form`, throws SyntaxError, and renders an empty
+ * `<div id="root">` — a blank white page with no visible cause. Every runtime
+ * probe agrees the page is "fine" because nothing ever ran to fail.
+ *
+ * Checked statically, and across FILES rather than just the HTML, because the
+ * JSX usually lives in a separate script the HTML merely references — looking
+ * only at the document that was passed to `verify` misses it entirely.
+ */
+export function scanJsxWithoutTranspiler(
+  html: string,
+  /** Local scripts the HTML pulls in: the `src` as written, and its source. */
+  externals: ReadonlyArray<{ src: string; content: string }> = [],
+): Finding[] {
+  const findings: Finding[] = [];
+  const hasBabel = /babel(?:-standalone|\.min)?\.js|@babel\/standalone|unpkg\.com\/@babel/i.test(html);
+
+  // Inline blocks: JSX is only safe inside a type the transpiler claims.
+  for (const m of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    const attrs = m[1] ?? '';
+    const body = m[2] ?? '';
+    if (!looksLikeJsx(body)) continue;
+    const isBabelType = /type\s*=\s*["']text\/babel["']/i.test(attrs);
+    if (!isBabelType || !hasBabel) {
+      findings.push({
+        check: 'jsx-not-transpiled',
+        severity: 'error',
+        message: isBabelType
+          ? 'An inline <script type="text/babel"> contains JSX, but Babel Standalone is never loaded — nothing transpiles it, so the block never runs'
+          : 'An inline <script> contains JSX. Without type="text/babel" the browser parses it as plain JavaScript, throws a SyntaxError at the first tag, and the page renders blank',
+        repair:
+          'Load Babel Standalone (<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>) AND mark the JSX block type="text/babel" — both are required.',
+      });
+    }
+  }
+
+  // External scripts: same rule, and the common shape of this bug.
+  for (const ext of externals) {
+    if (!looksLikeJsx(ext.content)) continue;
+    const tag = new RegExp(`<script\\b[^>]*src\\s*=\\s*["'][^"']*${ext.src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}["'][^>]*>`, 'i').exec(html);
+    const isBabelType = tag ? /type\s*=\s*["']text\/babel["']/i.test(tag[0]) : false;
+    if (!isBabelType || !hasBabel) {
+      findings.push({
+        check: 'jsx-not-transpiled',
+        severity: 'error',
+        message: `${ext.src} contains JSX but is loaded as a plain script${hasBabel ? ' without type="text/babel"' : ' and Babel Standalone is never loaded'} — the browser throws a SyntaxError at the first tag and the page renders blank`,
+        repair:
+          `Either move the component into an inline <script type="text/babel"> block with Babel Standalone loaded, or write it without JSX using React.createElement(...). A plain <script src="${ext.src}"> can never contain JSX.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
 /**
  * Static scan for characters that make a script fail to COMPILE.
  *

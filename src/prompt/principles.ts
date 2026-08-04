@@ -134,6 +134,9 @@ export const MEDIA: Record<Medium, MediumProfile> = {
     id: 'web',
     label: 'web page / web app',
     notes: [
+      'No build step exists here (no npm, no bundler, no Babel CLI). `import "react"` or raw JSX in a plain ' +
+        '<script> will not run — it renders a blank page, silently. For React, load the UMD build + Babel ' +
+        'Standalone from a CDN in a <script type="text/babel"> block; otherwise use plain HTML/CSS/JS.',
       'Layout with flex or grid; avoid absolute positioning except for overlays.',
       'One <h1>. Set <html lang> and a width=device-width viewport meta.',
       'Straight quotes only in scripts — a typographic quote is a syntax error.',
